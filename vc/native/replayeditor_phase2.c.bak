@@ -1,0 +1,505 @@
+/*
+ * Replay Editor for GTA Vice City v1.0 - native module (Phase 2)
+ *
+ * Loaded by CLEO\ReplayEditor.cs (0AA2) which calls RE_Init once per script
+ * start. Freestanding: no CRT, no import libraries. Win32 functions are
+ * resolved through the game's own IAT (GetModuleHandleA / GetProcAddress).
+ *
+ * Hooks (all are E8 rel32 calls, the previous target is kept and chained):
+ *   0x4A45C3  CGame::Process      -> CReplay::Update            (keys, enter/exit)
+ *   0x624F20  CReplay::Update     -> CReplay::PlaybackThisFrame (pause/speed/seek)
+ *   0x4A61D6  Render2dStuff       -> CReplay::Display           (editor HUD)
+ */
+typedef unsigned char u8;
+typedef unsigned short u16;
+typedef unsigned int u32;
+
+int _fltused = 1;
+
+#pragma function(memset, memcpy)
+void *__cdecl memset(void *d, int c, unsigned n) { u8 *p = (u8 *)d; while (n--) *p++ = (u8)c; return d; }
+void *__cdecl memcpy(void *d, const void *s, unsigned n) { u8 *p = (u8 *)d; const u8 *q = (const u8 *)s; while (n--) *p++ = *q++; return d; }
+
+/* ------------------------------------------------------------------ game */
+#define G8(a)   (*(volatile u8 *)(a))
+#define G32(a)  (*(volatile u32 *)(a))
+#define GI32(a) (*(volatile int *)(a))
+#define GPTR(a) (*(u8 *volatile *)(a))
+
+#define IAT_GetModuleHandleA 0x6F2464
+#define IAT_GetProcAddress   0x6F2488
+
+#define A_MODE          0xA10AF6   /* CReplay::Mode 0 rec 1 play */
+#define A_BUFSTATUS     0x94D4E0   /* u8[8] 0 unused 1 full 2 current */
+#define A_BUFFERS       0x869CB8   /* 8 x 100000 */
+#define BUFSZ           100000
+#define A_PB_OFF        0x9B5F58   /* playback position: offset */
+#define A_PB_BASE       0x9B5F5C   /*                    buffer pointer */
+#define A_PB_SLOT       0x9B5F60   /*                    slot */
+#define A_DIVISOR       0xA0D95C   /* interpolation frames per recorded frame */
+#define A_INTERP_CNT    0x7869B4
+#define A_SCREEN_W      0x9B48E4
+#define A_SCREEN_H      0x9B48E8
+
+#define F_UPDATE        0x624EC0
+#define F_PLAYBACK      0x6230A0
+#define F_LOOKAROUND    0x61E970
+#define F_DISPLAY       0x620BE0
+#define F_PLAYFROMHD    0x61F0E0
+#define F_FINISH        0x6210E0
+#define F_GETPAD        0x4AB060   /* CPad *GetPad(int) */
+#define F_CUTSCENE      0x54E100   /* bool, blocks replay keys */
+
+#define SITE_UPDATE     0x4A45C3
+#define SITE_PLAYBACK   0x624F20
+#define SITE_DISPLAY    0x4A61D6
+
+typedef void (__cdecl *vfn)(void);
+typedef void *(__cdecl *GetPadFn)(int);
+typedef char (__cdecl *BoolFn)(void);
+typedef void (__cdecl *F2Fn)(float, float);
+typedef void (__cdecl *F1Fn)(float);
+typedef void (__cdecl *I1Fn)(int);
+typedef void (__cdecl *PFn)(const void *);
+typedef void (__cdecl *PrintFn)(float, float, const u16 *);
+typedef void (__cdecl *RectFn)(const float *, const u8 *);
+
+#define Font_SetScale      ((F2Fn)0x550230)
+#define Font_ResetA        ((vfn)0x550140)   /* clears 0x97F838/0x97F83A */
+#define Font_ResetB        ((vfn)0x5500D0)   /* clears 0x97F83B */
+#define Font_SetWrapx      ((F1Fn)0x5500F0)
+#define Font_ResetC        ((vfn)0x550110)   /* clears 0x97F839 */
+#define Font_SetPropOn     ((vfn)0x550020)
+#define Font_SetColor      ((PFn)0x550170)
+#define Font_SetFontStyle  ((I1Fn)0x54FFE0)
+#define Font_PrintString   ((PrintFn)0x551040)
+#define Sprite2d_DrawRect  ((RectFn)0x577B00)
+
+/* ----------------------------------------------------------------- win32 */
+typedef void *(__stdcall *GetModuleHandleAFn)(const char *);
+typedef void *(__stdcall *GetProcAddressFn)(void *, const char *);
+typedef int (__stdcall *VirtualProtectFn)(void *, u32, u32, u32 *);
+typedef short (__stdcall *GetAsyncKeyStateFn)(int);
+typedef void *(__stdcall *CreateFileAFn)(const char *, u32, u32, void *, u32, u32, void *);
+typedef int (__stdcall *WriteFileFn)(void *, const void *, u32, u32 *, void *);
+typedef int (__stdcall *FlushFileBuffersFn)(void *);
+
+static VirtualProtectFn pVirtualProtect;
+static GetAsyncKeyStateFn pGetAsyncKeyState;
+static CreateFileAFn pCreateFileA;
+static WriteFileFn pWriteFile;
+static FlushFileBuffersFn pFlushFileBuffers;
+static void *g_log = (void *)-1;
+
+/* ---------------------------------------------------------------- string */
+static int slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
+static char *sput(char *d, const char *s) { while (*s) *d++ = *s++; *d = 0; return d; }
+static char *iput(char *d, int v, int width)
+{
+    char tmp[12]; int n = 0; u32 u;
+    if (v < 0) { *d++ = '-'; u = (u32)(-v); } else u = (u32)v;
+    do { tmp[n++] = (char)('0' + u % 10); u /= 10; } while (u);
+    while (n < width) tmp[n++] = '0';
+    while (n) *d++ = tmp[--n];
+    *d = 0;
+    return d;
+}
+static char *hput(char *d, u32 v)
+{
+    int i;
+    *d++ = '0'; *d++ = 'x';
+    for (i = 28; i >= 0; i -= 4) *d++ = "0123456789ABCDEF"[(v >> i) & 15];
+    *d = 0;
+    return d;
+}
+static char *tput(char *d, u32 ms)   /* mm:ss.cc */
+{
+    d = iput(d, (int)(ms / 60000), 2); *d++ = ':';
+    d = iput(d, (int)(ms / 1000 % 60), 2); *d++ = '.';
+    return iput(d, (int)(ms / 10 % 100), 2);
+}
+
+static void logs(const char *s)
+{
+    u32 w;
+    if (g_log == (void *)-1 || !pWriteFile) return;
+    pWriteFile(g_log, s, slen(s), &w, 0);
+    pWriteFile(g_log, "\r\n", 2, &w, 0);
+    if (pFlushFileBuffers) pFlushFileBuffers(g_log);
+}
+
+/* ----------------------------------------------------------------- hooks */
+static u32 orig_update, orig_playback, orig_display;
+
+static u32 hook_call(u32 site, void *fn, const char *name)
+{
+    u8 *p = (u8 *)site;
+    u32 old, target;
+    char line[96], *e;
+    if (p[0] != 0xE8) {
+        e = sput(line, "hook FAILED (not a call): "); sput(e, name); logs(line);
+        return 0;
+    }
+    target = site + 5 + *(int *)(p + 1);
+    if (target == (u32)fn) return 0;               /* already ours */
+    if (!pVirtualProtect(p + 1, 4, 0x40, &old)) { logs("VirtualProtect failed"); return 0; }
+    *(int *)(p + 1) = (int)((u32)fn - (site + 5));
+    pVirtualProtect(p + 1, 4, old, &old);
+    e = sput(line, "hooked "); e = sput(e, name); e = sput(e, " prev target "); hput(e, target);
+    logs(line);
+    return target;
+}
+
+/* ----------------------------------------------------------- frame table */
+#define MAXF 16384
+static const u8 PKT_SIZE[13] = { 0, 0x34, 0x2C, 0x08, 0x2C, 0x58, 0x04, 0x08, 0x04, 0x08, 0x1C, 0x14, 0x10 };
+static u8 fr_slot[MAXF];
+static u32 fr_off[MAXF];
+static u32 fr_time[MAXF];
+static int nfr;
+static int slot_first[8];
+/* The recorder writes PARTICLE packets between frames and switches buffer
+   later, so a frame can begin with particles at the tail of one slot and
+   continue in the next. slot_tail_off[s] = where such a frame starts in s. */
+static u32 slot_tail_off[8];
+static int slot_tail_frame[8];
+
+static u8 *slot_base(int s) { return (u8 *)A_BUFFERS + s * BUFSZ; }
+
+static int build_table(void)
+{
+    int s, guard, i;
+    u32 t = 0;
+    nfr = 0;
+    for (i = 0; i < 8; i++) { slot_first[i] = -1; slot_tail_off[i] = 0xFFFFFFFF; slot_tail_frame[i] = -1; }
+    for (s = 0; s < 8 && G8(A_BUFSTATUS + s) != 2; s++) {}
+    if (s == 8) return 0;
+    /* first slot to play: after the current one, status 1 or 2 (TriggerPlayback) */
+    s = (s + 1) & 7;
+    for (guard = 0; guard < 8 && G8(A_BUFSTATUS + s) != 1 && G8(A_BUFSTATUS + s) != 2; guard++) s = (s + 1) & 7;
+    for (guard = 0; guard < 8; guard++) {
+        u8 *b = slot_base(s);
+        u32 off = 0, open_off = 0;
+        int open = 0;
+        slot_first[s] = nfr;
+        while (off < BUFSZ) {
+            u8 type = b[off];
+            if (type == 0) break;
+            if (type > 12) { logs("frame table: bad packet type"); return 0; }
+            if (!open) {
+                if (nfr >= MAXF) { logs("frame table: too many frames"); return 0; }
+                fr_slot[nfr] = (u8)s; fr_off[nfr] = off; open = 1; open_off = off;
+            }
+            if (type == 9) t = *(u32 *)(b + off + 4);
+            off += PKT_SIZE[type];
+            if (type == 8) { fr_time[nfr] = t; nfr++; open = 0; }
+        }
+        if (open) {                    /* frame continues in the next slot */
+            slot_tail_off[s] = open_off;
+            slot_tail_frame[s] = nfr;  /* its entry is (re)created there */
+        }
+        if (slot_first[s] == nfr) slot_first[s] = -1;
+        if (G8(A_BUFSTATUS + s) == 2) break;
+        s = (s + 1) & 7;
+    }
+    return nfr > 0;
+}
+
+/* index of the next frame PlaybackThisFrame will process; nfr = at the end */
+static int cur_index(void)
+{
+    u32 off = G32(A_PB_OFF);
+    int s = G8(A_PB_SLOT), i;
+    u8 *base = GPTR(A_PB_BASE);
+    if (!base || off >= BUFSZ) return -1;
+    if (base[off] == 0) {
+        if (G8(A_BUFSTATUS + s) == 2) return nfr;
+        s = (s + 1) & 7;
+        off = 0;
+    }
+    if (off == slot_tail_off[s]) return slot_tail_frame[s];
+    i = slot_first[s];
+    if (i < 0) return -1;
+    for (; i < nfr && fr_slot[i] == s; i++)
+        if (fr_off[i] == off) return i;
+    return -1;
+}
+
+static int g_installed;
+
+/* ---------------------------------------------------------------- editor */
+static const int SPEED_DIV[5] = { 4, 2, 1, 1, 1 };
+static const int SPEED_REP[5] = { 1, 1, 1, 2, 4 };
+static const char *SPEED_TXT[5] = { "X0.25", "X0.5", "X1", "X2", "X4" };
+
+static struct {
+    int active, paused, need_step, speed;
+    int msg_frames;
+    char msg[64];
+} ed;
+
+static u8 key_now[256], key_prev[256];
+static int key_hold[256];
+
+static void poll_keys(void)
+{
+    static const u8 used[] = { 0x10, 0x20, 0x23, 0x24, 0x25, 0x27, 0x31, 0x32, 0x33, 0x34, 0x35, 0x73 };
+    int i;
+    for (i = 0; i < (int)sizeof(used); i++) {
+        int k = used[i];
+        key_prev[k] = key_now[k];
+        key_now[k] = pGetAsyncKeyState && (pGetAsyncKeyState(k) & 0x8000) ? 1 : 0;
+        key_hold[k] = key_now[k] ? key_hold[k] + 1 : 0;
+    }
+}
+static int pressed(int k) { return key_now[k] && !key_prev[k]; }
+/* pressed, then auto-repeat after 12 frames every 2 frames */
+static int repeat(int k) { return pressed(k) || (key_hold[k] > 12 && (key_hold[k] & 1)); }
+
+static void message(const char *s)
+{
+    int n = slen(s);
+    if (n > 63) n = 63;
+    memcpy(ed.msg, s, n); ed.msg[n] = 0;
+    ed.msg_frames = 90;
+}
+
+static void set_speed(int sp)
+{
+    ed.speed = sp;
+    G32(A_DIVISOR) = SPEED_DIV[sp];
+    G32(A_INTERP_CNT) = 0;
+}
+
+static void call_playback(void) { ((vfn)orig_playback)(); }
+
+/* play frames until frame f has been processed (cur == f + 1) */
+static void seek(int f)
+{
+    int s, guard = 0;
+    if (nfr <= 0 || G8(A_MODE) != 1) return;
+    if (f < 0) f = 0;
+    if (f >= nfr) f = nfr - 1;
+    G32(A_DIVISOR) = 1;
+    G32(A_INTERP_CNT) = 0;
+    if (cur_index() != f) {               /* not simply the next frame */
+        s = fr_slot[f];
+        G8(A_PB_SLOT) = (u8)s;
+        G32(A_PB_OFF) = 0;
+        GPTR(A_PB_BASE) = slot_base(s);
+    }
+    while (G8(A_MODE) == 1 && guard++ < MAXF) {
+        int c = cur_index();
+        if (c < 0 || c > f) break;
+        call_playback();
+    }
+    set_speed(ed.speed);
+}
+
+static int shown_frame(void)
+{
+    int c = cur_index();
+    if (c < 0) return -1;
+    return c > 0 ? c - 1 : 0;
+}
+
+static int can_enter(void)
+{
+    u8 *pad;
+    if (G8(A_MODE) != 0) return 0;
+    if (G8(0xA10B63) || G8(0x869668) || G8(0xA10B76) || G8(0xA10B36) || G8(0xA10B16)) return 0;
+    if (!G8(0x6DB5D8)) return 0;
+    pad = (u8 *)((GetPadFn)F_GETPAD)(0);
+    if (pad && *(short *)(pad + 0xF0)) return 0;
+    if (((BoolFn)F_CUTSCENE)()) return 0;
+    return 1;
+}
+
+static void enter_editor(void)
+{
+    char line[96], *e;
+    ((vfn)F_PLAYFROMHD)();
+    if (G8(A_MODE) != 1) { message("REPLAY EDITOR: COULD NOT LOAD REPLAY FILE"); logs("enter: load failed"); return; }
+    if (!build_table()) { message("REPLAY EDITOR: REPLAY DATA NOT RECOGNISED"); logs("enter: frame table failed"); return; }
+    ed.active = 1;
+    ed.paused = 1;
+    ed.need_step = 1;
+    set_speed(2);
+    e = sput(line, "enter: frames "); e = iput(e, nfr, 0); e = sput(e, " duration ms ");
+    iput(e, (int)(fr_time[nfr - 1] - fr_time[0]), 0);
+    logs(line);
+}
+
+static void exit_editor(void)
+{
+    ed.active = 0;
+    G32(A_DIVISOR) = 1;
+    G32(A_INTERP_CNT) = 0;
+    if (G8(A_MODE) == 1) ((vfn)F_FINISH)();
+    logs("exit");
+}
+
+static void __cdecl hk_update(void)
+{
+    int shift, f;
+    if (!g_installed) { ((vfn)orig_update)(); return; }
+    poll_keys();
+    if (ed.msg_frames > 0) ed.msg_frames--;
+    if (ed.active && G8(A_MODE) != 1) { ed.active = 0; logs("playback ended outside the editor"); }
+    if (!ed.active) {
+        if (pressed(0x73) && can_enter()) enter_editor();
+        ((vfn)orig_update)();
+        return;
+    }
+    if (pressed(0x73)) { exit_editor(); return; }
+    shift = key_now[0x10];
+    f = shown_frame();
+    if (pressed(0x20)) {                                   /* Space */
+        if (ed.paused && f >= nfr - 1) seek(0);
+        ed.paused = !ed.paused;
+    }
+    if (f >= 0) {
+        if (repeat(0x25)) { ed.paused = shift ? ed.paused : 1; seek(f - (shift ? 30 : 1)); }
+        if (repeat(0x27)) { ed.paused = shift ? ed.paused : 1; seek(f + (shift ? 30 : 1)); }
+        if (pressed(0x24)) seek(0);
+        if (pressed(0x23)) { ed.paused = 1; seek(nfr - 1); }
+    }
+    { int k; for (k = 0; k < 5; k++) if (pressed(0x31 + k)) set_speed(k); }
+    ((vfn)orig_update)();
+}
+
+static void __cdecl hk_playback(void)
+{
+    int c, i;
+    if (!ed.active || !g_installed) { call_playback(); return; }
+    c = cur_index();
+    if (c < 0) { call_playback(); return; }               /* unknown position: let the game run */
+    if (ed.need_step) {
+        ed.need_step = 0;
+        if (c < nfr) { G32(A_DIVISOR) = 1; G32(A_INTERP_CNT) = 0; call_playback(); set_speed(ed.speed); }
+        return;
+    }
+    /* never let the game reach the end of the data: it would finish playback.
+       With slow motion the game also reads the frame after the current one. */
+    if (c >= nfr || (G32(A_DIVISOR) > 1 && c >= nfr - 1)) ed.paused = 1;
+    if (ed.paused) { ((vfn)F_LOOKAROUND)(); return; }
+    for (i = 0; i < SPEED_REP[ed.speed]; i++) {
+        c = cur_index();
+        if (G8(A_MODE) != 1 || c < 0 || c >= nfr) break;
+        call_playback();
+    }
+    c = cur_index();
+    if (c >= nfr) ed.paused = 1;
+}
+
+/* ------------------------------------------------------------------- HUD */
+static float g_w, g_h;
+
+static void rect(float x0, float y0, float x1, float y1, u8 r, u8 g, u8 b, u8 a)
+{
+    float rc[4];
+    u8 col[4];
+    rc[0] = x0; rc[1] = y1; rc[2] = x1; rc[3] = y0;
+    col[0] = r; col[1] = g; col[2] = b; col[3] = a;
+    Sprite2d_DrawRect(rc, col);
+}
+
+static void text(float x, float y, float scale, u8 r, u8 g, u8 b, const char *s)
+{
+    u16 w[128];
+    u8 col[4];
+    int i;
+    for (i = 0; s[i] && i < 127; i++) w[i] = (u8)s[i];
+    w[i] = 0;
+    Font_SetScale(g_w / 640.0f * 0.5f * scale, g_h / 448.0f * 1.0f * scale);
+    Font_ResetA();
+    Font_ResetB();
+    Font_SetWrapx(g_w);
+    Font_ResetC();
+    Font_SetPropOn();
+    col[0] = r; col[1] = g; col[2] = b; col[3] = 255;
+    Font_SetColor(col);
+    Font_SetFontStyle(1);
+    Font_PrintString(x, y, w);
+}
+
+static void draw_editor_hud(void)
+{
+    char line[128], *e;
+    int f = shown_frame(), i;
+    float x0, x1, y0, y1, t, cx;
+    u32 dur;
+    if (f < 0) f = 0;
+    dur = nfr > 0 ? fr_time[nfr - 1] - fr_time[0] : 0;
+
+    rect(0, 0, g_w, g_h * 0.075f, 0, 0, 0, 150);
+    e = sput(line, "REPLAY EDITOR   ");
+    e = sput(e, ed.paused ? "PAUSED   " : "PLAYING   ");
+    e = tput(e, fr_time[f] - fr_time[0]); e = sput(e, " / "); e = tput(e, dur);
+    e = sput(e, "   "); e = sput(e, SPEED_TXT[ed.speed]);
+    e = sput(e, "   FRAME "); e = iput(e, f + 1, 0); e = sput(e, " / "); iput(e, nfr, 0);
+    text(g_w * 0.03f, g_h * 0.02f, 1.0f, 255, 255, 255, line);
+
+    x0 = g_w * 0.05f; x1 = g_w * 0.95f; y0 = g_h * 0.885f; y1 = g_h * 0.900f;
+    rect(0, g_h * 0.86f, g_w, g_h, 0, 0, 0, 150);
+    rect(x0, y0, x1, y1, 70, 70, 70, 220);
+    t = nfr > 1 ? (float)f / (float)(nfr - 1) : 0.0f;
+    cx = x0 + (x1 - x0) * t;
+    rect(x0, y0, cx, y1, 235, 125, 40, 230);
+    for (i = 1; i < nfr; i++)                              /* buffer boundaries */
+        if (fr_slot[i] != fr_slot[i - 1]) {
+            float bx = x0 + (x1 - x0) * (float)i / (float)(nfr - 1);
+            rect(bx - 1.0f, y1, bx + 1.0f, y1 + g_h * 0.006f, 160, 160, 160, 200);
+        }
+    rect(cx - 2.0f, y0 - g_h * 0.010f, cx + 2.0f, y1 + g_h * 0.010f, 255, 255, 255, 255);
+    text(g_w * 0.05f, g_h * 0.915f, 0.8f, 210, 210, 210,
+         "SPACE PLAY/PAUSE   LEFT/RIGHT FRAME   SHIFT+LEFT/RIGHT 1 SEC   HOME/END   1-5 SPEED   F4 EXIT");
+}
+
+static void __cdecl hk_display(void)
+{
+    if (!g_installed) { ((vfn)orig_display)(); return; }
+    g_w = (float)GI32(A_SCREEN_W);
+    g_h = (float)GI32(A_SCREEN_H);
+    if (ed.active && G8(A_MODE) == 1) draw_editor_hud();
+    else ((vfn)orig_display)();
+    if (ed.msg_frames > 0) {
+        rect(0, g_h * 0.45f, g_w, g_h * 0.53f, 0, 0, 0, 170);
+        text(g_w * 0.05f, g_h * 0.465f, 1.0f, 255, 210, 120, ed.msg);
+    }
+}
+
+/* ------------------------------------------------------------------ init */
+__declspec(dllexport) int __cdecl RE_Init(void)
+{
+    void *k32, *u32m;
+    GetModuleHandleAFn gmh;
+    GetProcAddressFn gpa;
+    if (g_installed) return 2;
+    gmh = *(GetModuleHandleAFn *)IAT_GetModuleHandleA;
+    gpa = *(GetProcAddressFn *)IAT_GetProcAddress;
+    k32 = gmh("kernel32.dll");
+    u32m = gmh("user32.dll");
+    if (!k32 || !u32m) return -1;
+    pVirtualProtect = (VirtualProtectFn)gpa(k32, "VirtualProtect");
+    pCreateFileA = (CreateFileAFn)gpa(k32, "CreateFileA");
+    pWriteFile = (WriteFileFn)gpa(k32, "WriteFile");
+    pFlushFileBuffers = (FlushFileBuffersFn)gpa(k32, "FlushFileBuffers");
+    pGetAsyncKeyState = (GetAsyncKeyStateFn)gpa(u32m, "GetAsyncKeyState");
+    if (!pVirtualProtect || !pGetAsyncKeyState) return -2;
+    if (pCreateFileA)   /* GENERIC_WRITE, FILE_SHARE_READ, CREATE_ALWAYS, NORMAL */
+        g_log = pCreateFileA("CLEO\\ReplayEditor\\ReplayEditor.log", 0x40000000, 1, 0, 2, 0x80, 0);
+    logs("Replay Editor native module (phase 2) init");
+    orig_update = hook_call(SITE_UPDATE, (void *)hk_update, "CReplay::Update");
+    orig_playback = hook_call(SITE_PLAYBACK, (void *)hk_playback, "PlaybackThisFrame");
+    orig_display = hook_call(SITE_DISPLAY, (void *)hk_display, "CReplay::Display");
+    if (!orig_update || !orig_playback || !orig_display) { logs("init incomplete"); return -3; }
+    g_installed = 1;
+    return 1;
+}
+
+int __stdcall _DllMainCRTStartup(void *h, u32 reason, void *reserved)
+{
+    (void)h; (void)reason; (void)reserved;
+    return 1;
+}

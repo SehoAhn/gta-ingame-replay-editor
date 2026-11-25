@@ -1,0 +1,840 @@
+"""Unicorn harness for ReplayEditor.dll (phase 2).
+
+The real DLL runs against a fake gta-vc.exe memory image. Game functions are
+stubs; PlaybackThisFrame is modelled in Python with the game's pointer /
+interpolation semantics (0x6230A0 + 0x621230):
+  * one call processes the frame at the committed pointer; if the counter is
+    non-zero it also reads the following frame (slow motion);
+  * reading END of the status-2 slot = FinishPlayback (Mode -> 0)  -> FAIL;
+  * the counter wraps by the divisor and commits the pointer when it is 0.
+usage: emu_editor.py some.rep
+"""
+import struct
+import sys
+import os
+
+from unicorn import Uc, UC_ARCH_X86, UC_MODE_32, UC_HOOK_CODE
+from unicorn.x86_const import UC_X86_REG_ESP, UC_X86_REG_EAX, UC_X86_REG_EIP
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from repparse import load  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DLL = os.path.join(HERE, "..", "native", "obj", "ReplayEditor.dll")   # freshly built
+SIZES = {1: 0x34, 2: 0x2C, 3: 0x08, 4: 0x2C, 5: 0x58, 6: 4, 7: 8, 8: 4, 9: 8, 10: 0x1C, 11: 0x14, 12: 0x10}
+
+MODE, BUFSTATUS, BUFFERS = 0xA10AF6, 0x94D4E0, 0x869CB8
+PB_OFF, PB_BASE, PB_SLOT = 0x9B5F58, 0x9B5F5C, 0x9B5F60
+DIVISOR, CNT = 0xA0D95C, 0x7869B4
+STUB_BASE = 0x00300000
+
+uc = Uc(UC_ARCH_X86, UC_MODE_32)
+uc.mem_map(0x00200000, 0x00200000)          # stack + stubs
+uc.mem_map(0x00400000, 0x00700000)          # game image + bss
+dll = open(DLL, "rb").read()
+pe = struct.unpack_from("<I", dll, 0x3C)[0]
+nsec = struct.unpack_from("<H", dll, pe + 6)[0]
+opt = pe + 24
+base = struct.unpack_from("<I", dll, opt + 28)[0]
+size_img = struct.unpack_from("<I", dll, opt + 56)[0]
+uc.mem_map(base, (size_img + 0xFFF) & ~0xFFF)
+uc.mem_write(base, dll[:0x400])
+sec = opt + struct.unpack_from("<H", dll, pe + 20)[0]
+for k in range(nsec):
+    va, raw_size, raw_ptr = struct.unpack_from("<III", dll, sec + 40 * k + 12)
+    uc.mem_write(base + va, dll[raw_ptr:raw_ptr + raw_size])
+# export RE_Init
+exp_rva = struct.unpack_from("<I", dll, opt + 96)[0]
+nfun = struct.unpack_from("<I", dll, 0)[0]
+def rd32(a): return struct.unpack("<I", bytes(uc.mem_read(a, 4)))[0]
+def wr32(a, v): uc.mem_write(a, struct.pack("<I", v & 0xFFFFFFFF))
+def rd8(a): return uc.mem_read(a, 1)[0]
+def wr8(a, v): uc.mem_write(a, bytes([v & 0xFF]))
+funcs = rd32(base + exp_rva + 28)
+RE_INIT = base + rd32(base + funcs)
+
+# --- stubs: every stub is a 'ret' that a code hook intercepts -------------
+stubs, names = {}, {}
+def stub(name, addr=None):
+    if addr is None:
+        addr = STUB_BASE + 16 * len(stubs)
+    stubs[addr] = name
+    names[name] = addr
+    uc.mem_write(addr, b"\xC3")
+    return addr
+
+for n in ("GetModuleHandleA", "GetProcAddress", "VirtualProtect", "GetAsyncKeyState",
+          "CreateFileA", "WriteFile", "FlushFileBuffers"):
+    stub(n)
+FS = {}            # fake file system: (dir, name) -> bytearray
+HANDLES = {}       # handle -> [key, position]
+fsstate = {"cwd": "root", "next": 0x100}
+wr32(0x6F2464, names["GetModuleHandleA"])
+wr32(0x6F2488, names["GetProcAddress"])
+for n, a in (("LookAround", 0x61E970), ("Display", 0x620BE0),
+             ("PlayFromHD", 0x61F0E0), ("Finish", 0x6210E0), ("GetPad", 0x4AB060),
+             ("Trigger", 0x6209E0), ("StreamAll", 0x61F050),
+             ("Cutscene", 0x54E100), ("SetScale", 0x550230), ("F550140", 0x550140),
+             ("F5500d0", 0x5500D0), ("SetWrapx", 0x5500F0), ("F550110", 0x550110),
+             ("SetPropOn", 0x550020), ("SetColor", 0x550170), ("SetFontStyle", 0x54FFE0),
+             ("PrintString", 0x551040), ("DrawRect", 0x577B00),
+             ("MatUpdateRW", 0x46C3B6), ("RwMatrixUpdate", 0x6437B0),
+             ("RwFrameUpd", 0x644D00), ("RwFrameUpd2", 0x645320),
+             ("SetDirDocs", 0x48E020), ("SetDir", 0x48E030), ("OpenWrite", 0x48DF70),
+             ("FileWrite", 0x48DF30), ("FileClose", 0x48DEA0)):
+    stub(n, a)
+for n in ("ReadFile", "CloseHandle", "VirtualAlloc", "FindFirstFileA", "FindNextFileA", "FindClose",
+          "FileTimeToLocalFileTime", "FileTimeToSystemTime", "GetFileSize", "DeleteFileA", "GetModuleFileNameA", "GetPrivateProfileIntA"):
+    stub(n)
+FIND = {}
+FTIME = {}         # (dir, name) -> fake FILETIME counter (bigger = newer)
+def touch(key):
+    FTIME[key] = fsstate.setdefault("clock", 1000) + 1; fsstate["clock"] += 1
+uc.mem_map(0x01000000, 0x02000000)                # VirtualAlloc arena (32 MB)
+uc.mem_write(0x6DB604, b"replay.rep\0")
+uc.mem_write(0x6DB610, b"gtaVC7f\0")
+uc.mem_write(0x6DB638, b"\0")
+wr32(0x61F0EE, 0x6DB604)                            # PlayReplayFromHD file name operand
+stub("timeGetTime")
+# PlaybackThisFrame: Python core, then (like 0x6231B7) call ProcessLookAroundCam
+core = stub("PlaybackThisFrame")
+uc.mem_write(0x6230A0, bytes([0xE8]) + struct.pack("<i", core - (0x6230A0 + 5)))
+uc.mem_write(0x6230A5, bytes([0xE9]) + struct.pack("<i", 0x6231B7 - (0x6230A5 + 5)))
+uc.mem_write(0x6231B7, bytes([0xE8]) + struct.pack("<i", 0x61E970 - (0x6231B7 + 5)) + bytes([0xC3]))
+wr32(0x6F2594, names["timeGetTime"])
+# Scene.camera -> fake RwCamera whose +4 is a fake RwFrame
+RWCAM, RWFRAME = 0x00390000, 0x00391000
+wr32(0x7E4E90, RWCAM); wr32(RWCAM + 4, RWFRAME)
+
+def call_rel(site, target):
+    uc.mem_write(site, b"\xE8" + struct.pack("<i", target - (site + 5)))
+# CReplay::Update stub: if Mode == 1 -> call PlaybackThisFrame through site 0x624F20
+upd = bytes([0x80, 0x3D]) + struct.pack("<I", MODE) + b"\x01"     # cmp byte [MODE],1
+upd += b"\x75" + bytes([0x05])                                     # jne +5 -> ret
+uc.mem_write(0x624EC0, upd)
+uc.mem_write(0x624EC0 + len(upd), b"\xE9" + struct.pack("<i", 0x624F20 - (0x624EC0 + len(upd) + 5)))
+uc.mem_write(0x624EC0 + len(upd) + 5, b"\xC3")
+call_rel(0x624F20, 0x6230A0); uc.mem_write(0x624F25, b"\xC3")
+call_rel(0x4A45C3, 0x624EC0); uc.mem_write(0x4A45C8, b"\xF4")       # hlt
+call_rel(0x4A61D6, 0x620BE0); uc.mem_write(0x4A61DB, b"\xF4")
+# CGame::Process: if (ShouldStandardCameraBeProcessed()) TheCamera.Process()
+call_rel(0x4A45FA, 0x61EF70); uc.mem_write(0x4A45FF, b"\xF4")
+stub("StdCam", 0x61EF70)
+STDCAM_POS = (9999.0, 9999.0, 9999.0)   # what the live car camera would show
+wr8(0x6DB5D8, 1)
+wr32(0x9B48E4, 1920); wr32(0x9B48E8, 1080)          # screen size
+pad_area = 0x00380000
+
+keys = set()
+state = {"finished": False, "plays": 0, "text": [], "timers": [], "streams": 0}
+rep_bufs = load(sys.argv[1])
+loaded = {"bufs": rep_bufs, "name": None}
+FS[("docs", "replay.rep")] = bytearray(open(sys.argv[1], "rb").read()); touch(("docs", "replay.rep"))
+FS[("docs", "old.rep")] = bytearray(open(sys.argv[1], "rb").read()); FTIME[("docs", "old.rep")] = 5
+FS[("docs", "notes.txt")] = bytearray(b"x"); touch(("docs", "notes.txt"))
+LONG = len(FS[("docs", "replay.rep")]) > 8 + 8 * 100000      # > 8 buffers: window player, no game loader
+def loaded_by(name):
+    return (LONG and state.get("triggers", 0) > 0) or loaded["name"] == name
+
+def playback():
+    """game semantics of PlaybackThisFrame (divisor/counter/pointer)."""
+    state["plays"] += 1
+    off, slot = rd32(PB_OFF), rd8(PB_SLOT)
+    cache = {}
+    def mem(sl):                                   # the game's slots in emulated memory
+        if sl not in cache: cache[sl] = bytes(uc.mem_read(BUFFERS + sl * 100000, 100000))
+        return cache[sl]
+    tm = [None]
+    def read_frame(off, slot):
+        b = mem(slot)
+        while True:
+            t = b[off] if off < 100000 else 0
+            if t == 0:
+                if rd8(BUFSTATUS + slot) == 2:
+                    return None
+                slot = (slot + 1) & 7; off = 0; b = mem(slot)
+                continue
+            if t not in SIZES:
+                raise RuntimeError("playback: bad packet %d in slot %d at %d" % (t, slot, off))
+            if t == 9 and tm[0] is None: tm[0] = struct.unpack_from("<I", b, off + 4)[0]
+            off += SIZES[t]
+            if t == 8:
+                return off, slot
+    r = read_frame(off, slot)
+    if r is None:
+        state["finished"] = True; wr8(MODE, 0); return
+    state["timers"].append(tm[0])
+    cnt, div = rd32(CNT), rd32(DIVISOR)
+    if cnt != 0 and read_frame(*r) is None:
+        state["finished"] = True; wr8(MODE, 0); return
+    cnt = (cnt + 1) % div
+    wr32(CNT, cnt)
+    if cnt == 0:
+        wr32(PB_OFF, r[0]); wr8(PB_SLOT, r[1]); wr32(PB_BASE, BUFFERS + r[1] * 100000)
+
+def play_from_hd():
+    import tempfile
+    name = read_cstr(rd32(0x61F0EE))
+    data = FS.get(("docs", name))
+    state["loads"] = state.get("loads", []) + [name]
+    if data is None:
+        return
+    tmpf = os.path.join(tempfile.gettempdir(), "emu_load.rep")
+    open(tmpf, "wb").write(bytes(data))
+    bufs = load(tmpf)
+    loaded["bufs"], loaded["name"] = bufs, name
+    for i in range(8):
+        wr8(BUFSTATUS + i, 0)
+    for i, b in enumerate(bufs):
+        uc.mem_write(BUFFERS + i * 100000, bytes(b) + bytes(100000 - len(b)))
+        wr8(BUFSTATUS + i, 1)
+    wr8(BUFSTATUS + len(bufs) - 1, 2)
+    # TriggerPlayback: first slot after the current one with status 1/2
+    s = len(bufs) - 1
+    s = (s + 1) & 7
+    while rd8(BUFSTATUS + s) not in (1, 2):
+        s = (s + 1) & 7
+    wr8(MODE, 1); wr32(DIVISOR, 1); wr32(CNT, 0)
+    wr32(PB_OFF, 0); wr8(PB_SLOT, s); wr32(PB_BASE, BUFFERS + s * 100000)
+
+def read_cstr(a, wide=False):
+    out = []
+    while True:
+        if wide:
+            c = struct.unpack("<H", bytes(uc.mem_read(a, 2)))[0]; a += 2
+        else:
+            c = rd8(a); a += 1
+        if not c:
+            return "".join(out)
+        out.append(chr(c))
+
+def on_code(u, addr, size, _):
+    name = stubs.get(addr)
+    if not name:
+        return
+    esp = u.reg_read(UC_X86_REG_ESP)
+    arg = lambda i: rd32(esp + 4 + 4 * i)
+    ret, pop = 0, 0
+    if name == "GetModuleHandleA": ret, pop = 0x7000, 4
+    elif name == "GetProcAddress": ret, pop = names.get(read_cstr(arg(1)), 0), 8
+    elif name == "VirtualProtect": wr32(arg(3), 0x20); ret, pop = 1, 16
+    elif name == "GetAsyncKeyState": ret, pop = (0x8000 if arg(0) in keys else 0), 4
+    elif name == "CreateFileA":
+        key = (fsstate["cwd"], read_cstr(arg(0)))
+        if arg(4) == 3 and key not in FS:
+            ret = 0xFFFFFFFF
+        else:
+            if arg(4) == 2 or key not in FS:
+                FS[key] = bytearray(); touch(key)
+            fsstate["next"] += 1; ret = fsstate["next"]; HANDLES[ret] = [key, 0]
+        pop = 28
+    elif name == "WriteFile":
+        h = HANDLES.get(arg(0))
+        data = bytes(uc.mem_read(arg(1), arg(2)))
+        if h: FS[h[0]] += data
+        if arg(3): wr32(arg(3), arg(2))
+        ret, pop = 1, 20
+    elif name == "ReadFile":
+        h = HANDLES[arg(0)]
+        data = FS[h[0]][h[1]:h[1] + arg(2)]; h[1] += len(data)
+        uc.mem_write(arg(1), bytes(data)); wr32(arg(3), len(data))
+        ret, pop = 1, 20
+    elif name == "CloseHandle": HANDLES.pop(arg(0), None); ret, pop = 1, 4
+    elif name == "FindFirstFileA" or name == "FindNextFileA":
+        if name == "FindFirstFileA":
+            ext = read_cstr(arg(0))[1:].lower()
+            lst = sorted(k for k in FS if k[0] == fsstate["cwd"] and k[1].lower().endswith(ext))
+            fsstate["next"] += 1; h = fsstate["next"]; FIND[h] = lst
+        else:
+            h = arg(0)
+        lst = FIND.get(h, [])
+        if not lst:
+            ret = 0xFFFFFFFF if name == "FindFirstFileA" else 0
+        else:
+            k = lst.pop(0); d = arg(1)
+            uc.mem_write(d, bytes(320))
+            wr32(d, 0x20); wr32(d + 20, FTIME.get(k, 0)); wr32(d + 24, 0); wr32(d + 32, len(FS[k]))
+            uc.mem_write(d + 44, k[1].encode("latin-1") + b"\0")
+            ret = h if name == "FindFirstFileA" else 1
+        pop = 8
+    elif name == "GetModuleFileNameA":
+        nm = b"D:\\Games\\GTA VC\\gta-vc.exe\0"; uc.mem_write(arg(1), nm); ret, pop = len(nm) - 1, 12
+    elif name == "GetPrivateProfileIntA":
+        state["ini_path"] = read_cstr(arg(3)); ret, pop = state.get("ini_font", arg(2)), 16
+    elif name == "SetScale":
+        state["scales"].append(struct.unpack("<f", bytes(uc.mem_read(esp + 4, 4)))[0])
+    elif name == "DeleteFileA":
+        k = (fsstate["cwd"], read_cstr(arg(0))); ret = 1 if FS.pop(k, None) is not None else 0; pop = 4
+    elif name == "GetFileSize":
+        h = HANDLES.get(arg(0)); ret, pop = (len(FS[h[0]]) if h else 0xFFFFFFFF), 8
+    elif name == "FindClose": FIND.pop(arg(0), None); ret, pop = 1, 4
+    elif name == "FileTimeToLocalFileTime": uc.mem_write(arg(1), bytes(uc.mem_read(arg(0), 8))); ret, pop = 1, 8
+    elif name == "FileTimeToSystemTime":
+        lo = rd32(arg(0))
+        uc.mem_write(arg(1), struct.pack("<8H", 2026, 11, 0, 15, 17, lo % 60, 0, 0)); ret, pop = 1, 8
+    elif name == "VirtualAlloc":
+        ret = fsstate.setdefault("arena", 0x01000000); fsstate["arena"] += (arg(1) + 0xFFFF) & ~0xFFFF; pop = 16
+    elif name == "SetDirDocs": fsstate["cwd"] = "docs"
+    elif name == "SetDir": fsstate["cwd"] = "root" if read_cstr(arg(0)) == "" else read_cstr(arg(0))
+    elif name == "OpenWrite":
+        key = (fsstate["cwd"], read_cstr(arg(0)))
+        FS[key] = bytearray(); touch(key); fsstate["next"] += 1; ret = fsstate["next"]; HANDLES[ret] = [key, 0]
+    elif name == "FileWrite":
+        FS[HANDLES[arg(0)][0]] += bytes(uc.mem_read(arg(1), arg(2))); ret = arg(2)
+    elif name == "FileClose": HANDLES.pop(arg(0), None)
+    elif name == "FlushFileBuffers": ret, pop = 1, 4
+    elif name == "timeGetTime": ret = state.setdefault("ms", 1000)
+    elif name == "LookAround": state["look"] = state.get("look", 0) + 1
+    elif name == "PlaybackThisFrame": playback()
+    elif name == "StdCam":   # game: playback + player in a vehicle + look-around idle -> 1
+        ret = 1 if rd8(MODE) != 1 or rd32(0x94DD48) == 0 else 0
+    elif name == "PlayFromHD": play_from_hd()
+    elif name == "Trigger":       # CReplay::TriggerPlayback: Mode 1, first slot after the status-2 one
+        st = [rd8(BUFSTATUS + i) for i in range(8)]
+        s2 = st.index(2); sl = (s2 + 1) & 7
+        while st[sl] not in (1, 2): sl = (sl + 1) & 7
+        wr8(MODE, 1); wr32(DIVISOR, 1); wr32(CNT, 0)
+        wr32(PB_OFF, 0); wr8(PB_SLOT, sl); wr32(PB_BASE, BUFFERS + sl * 100000)
+        state["triggers"] = state.get("triggers", 0) + 1
+    elif name == "StreamAll": state["streams"] += 1
+    elif name == "Finish": wr8(MODE, 0)
+    elif name == "GetPad": ret = pad_area
+    elif name == "PrintString": state["text"].append(read_cstr(arg(2), True))
+    u.reg_write(UC_X86_REG_EAX, ret)
+    if pop:   # stdcall: emulate 'ret pop'
+        r = rd32(esp)
+        u.reg_write(UC_X86_REG_ESP, esp + 4 + pop)
+        u.reg_write(UC_X86_REG_EIP, r)
+
+uc.hook_add(UC_HOOK_CODE, on_code, begin=STUB_BASE, end=STUB_BASE + 0x1000)
+uc.hook_add(UC_HOOK_CODE, on_code, begin=0x400000, end=0x700000)
+STACK = 0x003F0000
+
+def call(addr, until):
+    uc.reg_write(UC_X86_REG_ESP, STACK)
+    uc.emu_start(addr, until)
+
+def ret_call(addr):
+    uc.reg_write(UC_X86_REG_ESP, STACK)
+    wr32(STACK, 0x00210000); uc.mem_write(0x00210000, b"\xF4")
+    uc.emu_start(addr, 0x00210000)
+    return uc.reg_read(UC_X86_REG_EAX)
+
+def frame(press=()):
+    state["ms"] = state.get("ms", 1000) + 33
+    keys.clear(); keys.update(press)
+    state["text"] = []
+    state["scales"] = []
+    call(0x4A45C3, 0x4A45C8)
+    call(0x4A45FA, 0x4A45FF)
+    state["stdcam"] = uc.reg_read(UC_X86_REG_EAX) & 0xFF
+    if state["stdcam"] and rd8(MODE) == 1:     # CCamera::Process overwrites the camera
+        for k, v in enumerate(STDCAM_POS): uc.mem_write(0x7E46B8 + 4 * k, struct.pack("<f", v))
+    call(0x4A61D6, 0x4A61DB)
+
+# ---- frame table (Python) for expectations --------------------------------
+from repparse import frames as pframes  # noqa: E402
+NFR = sum(1 for _ in pframes(rep_bufs))
+
+def status_line():
+    for t in state["text"]:
+        if t.startswith("PAUSED") or t.startswith("PLAYING"):
+            return t
+    return None
+
+def shown():
+    s = status_line()
+    return int(s.split("FRAME ")[1].split(" /")[0]) - 1 if s else None
+
+def list_names():
+    return [t for t in state["text"] if t.lower().endswith((".rep", ".prj")) and not t.startswith("PROJECT")]
+
+def open_from_menu(mode, name):
+    """F6 -> OPEN (mode 0) / PLAY (mode 1) -> file list -> name -> Enter"""
+    frame([0x75]); frame()
+    if mode == 1: frame([0x28]); frame()
+    frame([0x0D]); frame()
+    names = list_names()
+    idx = names.index(name)
+    for _ in range(idx): frame([0x28]); frame()
+    frame([0x0D]); frame()
+    return names
+
+def exit_ed():
+    frame([0x75]); frame()
+
+fails = []
+def check(cond, what):
+    print(("  ok   " if cond else "  FAIL ") + what)
+    if not cond:
+        fails.append(what)
+
+def toast_with(prefix):
+    return [t for t in state["text"] if t.startswith(prefix)]
+print("RE_Init ->", ret_call(RE_INIT), "| second call ->", ret_call(RE_INIT))
+print("frames in file:", NFR)
+frame(); frame()
+check(rd8(MODE) == 0 and status_line() is None, "idle: recording, no editor HUD")
+check(state["ini_path"] == "D:\\Games\\GTA VC\\CLEO\\ReplayEditor.ini", "INI path next to the game: %s" % state["ini_path"])
+frame([0x75]); frame()
+check(rd8(MODE) == 0 and "OPEN IN REPLAY EDITOR" in state["text"] and "PLAY REPLAY" in state["text"], "F6 opens the menu")
+check(abs(max(state["scales"]) - 1920 / 640 * 0.5 * 1.0 * 0.6) < 1e-4, "FONT_SCALE default 60%%: largest text x-scale %.3f" % max(state["scales"]))
+def keystate_dirty():
+    return any(uc.mem_read(0x7D15A8, 0x270)) or any(uc.mem_read(0x864A00, 0x270))
+uc.mem_write(0x7D15A8 + 0x100, b"\xff\x00"); uc.mem_write(0x864A00 + 0x100, b"\xff\x00")   # Enter held in the game
+frame([0x0D])
+check(not keystate_dirty() and "OPEN IN REPLAY EDITOR - SELECT A FILE" in state["text"],
+      "menu Enter is hidden from the game (key states cleared)")
+frame([0x08]); frame()
+uc.mem_write(0x7D15A8 + 0x100, b"\xff\x00")
+frame([0x75])
+check("OPEN IN REPLAY EDITOR" not in state["text"] and not keystate_dirty(), "F6 closes the menu (closing frame cleared too)")
+uc.mem_write(0x7D15A8 + 0x100, b"\xff\x00"); frame([0x75])
+check(not keystate_dirty(), "keys still hidden while the menu key is held after closing")
+uc.mem_write(0x7D15A8 + 0x100, b"\xff\x00"); frame(); frame()
+check(keystate_dirty(), "after releasing, the game gets its keys back")
+uc.mem_write(0x7D15A8, bytes(0x270))
+names = open_from_menu(0, "replay.rep")
+check(names == ["replay.rep", "old.rep"], "list: .rep/.prj only, newest first: %s" % names)
+check(rd8(MODE) == 1 and loaded_by("replay.rep"), "OPEN -> replay.rep loads it into the editor (%s)" % ("window" if LONG else "game loader"))
+check(rd32(0x61F0EE) == 0x6DB604, "load operand restored after loading")
+check(toast_with("NEW PROJECT - replay.rep"), "toast: new project")
+check(shown() == 0 and "PAUSED" in status_line(), "starts paused on frame 0: %s" % status_line())
+for _ in range(10): frame()
+check(shown() == 0, "stays paused")
+# paused, no time keys: the game's clock must not run on (CClock::Update keeps advancing it)
+def rec_clock(fr):
+    c = [raw for t, _b, _o, raw in list(pframes(rep_bufs))[fr] if t == 6][0]
+    return c[1], c[2]
+uc.mem_write(0xA10B6B, bytes([3])); uc.mem_write(0xA10B92, bytes([33]))     # as if the clock ran on
+frame()
+check((rd8(0xA10B6B), rd8(0xA10B92)) == rec_clock(0) and rd8(0xA10A3C) == 0,
+      "paused without time keys: clock pinned to the recorded %02d:%02d" % rec_clock(0))
+frame([0x27]); frame()
+uc.mem_write(0xA10B92, bytes([59])); frame()
+check((rd8(0xA10B6B), rd8(0xA10B92)) == rec_clock(1), "after stepping: clock = recorded clock of frame 1")
+frame([0x25]); frame()
+for _ in range(5): frame([0x27]); frame()
+check(shown() == 5, "Right x5 -> frame 5 (%s)" % shown())
+frame([0x10, 0x27]); frame([0x10])
+check(shown() == 35, "Shift+Right -> frame 35 (%s)" % shown())
+frame([0x25]); frame()
+check(shown() == 34, "Left -> 34 (%s)" % shown())
+frame([0x10, 0x25]); frame([0x10])
+check(shown() == 4, "Shift+Left -> 4 (%s)" % shown())
+frame([0x23]); frame()
+check(shown() == NFR - 1, "End -> last frame (%s)" % shown())
+for _ in range(30): frame()
+check(rd8(MODE) == 1 and not state["finished"], "paused at end does not finish playback")
+frame([0x20]); frame()
+check(shown() <= 2 and "PLAYING" in status_line(), "Space at end restarts from 0 (%s after 2 frames)" % shown())
+for _ in range(100): frame()
+check(abs(shown() - 101) <= 1, "1x plays one frame per game frame (%s)" % shown())
+# every frame, in order, exactly once at 1x from the start to the end
+if "PLAYING" in status_line(): frame([0x20]); frame()
+frame([0x33]); frame(); frame([0x24]); frame()
+state["timers"] = []
+frame([0x20])
+for _ in range(NFR + 20): frame()
+seq = [t for i, t in enumerate(state["timers"]) if i == 0 or t != state["timers"][i - 1]]
+src_times = [struct.unpack_from("<I", raw, 4)[0] for f in pframes(rep_bufs) for t, _b, _o, raw in f if t == 9]
+check(len(seq) >= NFR - 3 and seq == src_times[NFR - len(seq):],
+      "1x play-through processes every source frame once, in order (%d of %d)" % (len(seq), len(src_times)))
+check(rd8(MODE) == 1 and not state["finished"], "play-through to the end never finishes the playback")
+frame([0x35]); frame()
+s0 = shown()
+for _ in range(50): frame()
+check(abs(shown() - s0 - 200) <= 4 or (s0 + 200 > NFR - 1 and shown() == NFR - 1), "4x speed (%d -> %d)" % (s0, shown()))
+frame([0x31]); frame()
+s0 = shown()
+for _ in range(40): frame()
+check(abs(shown() - s0 - 10) <= 1 or s0 >= NFR - 2, "0.25x speed (%d -> %d)" % (s0, shown()))
+frame([0x33])
+for _ in range(NFR * 4): frame()
+check(rd8(MODE) == 1 and not state["finished"] and "PAUSED" in status_line(),
+      "1x to the end: auto-pause, never finishes (%s)" % shown())
+frame([0x24]); frame()
+check(shown() == 0, "Home -> 0 (%s)" % shown())
+frame([0x31]); frame([0x20])
+for _ in range(NFR * 5): frame()
+check(rd8(MODE) == 1 and not state["finished"], "0.25x to the end never finishes (%s)" % shown())
+# cross every buffer boundary backwards one frame at a time near boundaries
+frame([0x33]); frame([0x23]); frame()
+ok = True
+for _ in range(NFR - 1):
+    before = shown(); frame([0x25]); frame()
+    if shown() != before - 1:
+        ok = False; print("    left from", before, "->", shown()); break
+check(ok, "Left from the last frame back to 0, one by one, across buffer boundaries")
+# keys pressed in the editor pile up in the pad's PCTemp*State while CPad::Update is skipped
+uc.mem_write(pad_area + 0x6C + 0x24, b"\xff\x00")       # e.g. C (crouch) pressed in the editor
+uc.mem_write(pad_area + 0xC0, b"\x05\x00")
+frame([ord('C')])
+check(not any(uc.mem_read(pad_area + 0x6C, 0x7E)), "editor: key presses for the game are dropped every frame")
+uc.mem_write(pad_area + 0x6C + 0x24, b"\xff\x00")
+exit_ed()
+check(rd8(MODE) == 0 and status_line() is None, "F6 exits: playback finished by the editor, HUD gone")
+check(not any(uc.mem_read(pad_area, 0x54)) and not any(uc.mem_read(pad_area + 0x6C, 0x7E)),
+      "exit: pad input cleared, nothing pressed in the editor reaches the game")
+check(not state["finished"], "game never hit end-of-data on its own")
+# ---------------- phase 3: free camera + keyframes ------------------------
+import math
+def fset(a, v): uc.mem_write(a, struct.pack("<f", v))
+def fget(a): return struct.unpack("<f", bytes(uc.mem_read(a, 4)))[0]
+def campos(): return [fget(0x7E46B8 + 4 * k) for k in range(3)]
+def camfwd(): return [fget(0x7E4698 + 4 * k) for k in range(3)]
+def rwpos(): return [fget(RWFRAME + 0x10 + 0x30 + 4 * k) for k in range(3)]
+def hudline(prefix):
+    for t in state["text"]:
+        if t.startswith(("PAUSED", "PLAYING")): continue
+        if t.startswith(prefix) or (prefix == "KEYFRAMES" and "KEYFRAMES " in t): return t
+    return ""
+def player(f):
+    fr = list(pframes(rep_bufs))[f]
+    g = [raw for t, _b, _o, raw in fr if t == 5][0]
+    return struct.unpack_from("<3f", g, 0x4C)
+# a plausible recorded camera so pose_from_camera has something to read
+for k, v in enumerate((0, 1, 0)): fset(0x7E4688 + 4 * k, v)       # right
+for k, v in enumerate((1, 0, 0)): fset(0x7E4698 + 4 * k, v)       # fwd
+for k, v in enumerate((0, 0, 1)): fset(0x7E46A8 + 4 * k, v)       # up
+for k, v in enumerate((100, 200, 30)): fset(0x7E46B8 + 4 * k, v)  # pos
+fset(0x696658, 70.0)
+open_from_menu(0, "replay.rep")
+check(rd8(MODE) == 1 and "CAM RECORDED" in (status_line() or ""), "re-enter, recorded camera: %s" % (status_line() or ""))
+check(not any(t.startswith("PLAYBACK") for t in state["text"]) and "H SHOW HELP" in state["text"], "help closed by default")
+frame([ord('H')]); frame()
+check(any(t.startswith("PLAYBACK") for t in state["text"]), "H shows help")
+check(not any("WORK ON IT" in t or "IS KEPT" in t for t in state["text"]) and any(t.startswith("TRACKS") for t in state["text"])
+      and any(t.startswith("SAVE") and t.endswith(".edit.prj") for t in state["text"]), "help: shortened TRACKS / SAVE lines")
+frame([ord('H')]); frame()
+check(not any(t.startswith("PLAYBACK") for t in state["text"]), "H hides it again")
+frame([0x09]); frame()
+check("CAM FREE" in (status_line() or ""), "Tab -> free camera")
+p0 = campos()
+check(max(abs(a - b) for a, b in zip(p0, (100, 200, 30))) < 1e-3, "free cam starts at current camera %s" % p0)
+for _ in range(30): frame([ord('W')])
+p1 = campos()
+check(abs(p1[0] - 100 - 12.0 * 30 * 0.033) < 0.6 and abs(p1[1] - 200) < 1e-2, "W moves forward ~12 m/s: %s" % p1)
+check(max(abs(a - b) for a, b in zip(rwpos(), p1)) < 1e-4, "RW frame matrix follows TheCamera")
+fset(0x94D790, 20.0)
+frame(); fset(0x94D790, 0.0); frame()
+fw = camfwd()
+check(abs(math.atan2(fw[1], fw[0]) - (-0.1)) < 1e-3, "mouse X turns yaw like the look-around cam (yaw %.3f)" % math.atan2(fw[1], fw[0]))
+frame([ord('K')]); frame()
+check("KEYFRAMES 1" in hudline("KEYFRAMES"), "K adds keyframe at frame 1: %s" % hudline("KEYFRAMES"))
+kp0 = campos()
+for _ in range(2): frame([0x10, 0x27]); frame([0x10])
+check(shown() == 60, "Shift+Right x2 -> 60 (%s)" % shown())
+for _ in range(20): frame([ord('D')])
+frame([ord('K')]); frame()
+kp1 = campos()
+check("KEYFRAMES 2" in hudline("KEYFRAMES"), "second keyframe at 60")
+frame([0x09]); frame([0x24]); frame()
+check("CAM KEYFRAMES" in (status_line() or "") and max(abs(a - b) for a, b in zip(campos(), kp0)) < 1e-3,
+      "frame 0 shows keyframe 1 pose (%s)" % campos())
+for _ in range(2): frame([0x10, 0x27]); frame([0x10])
+check(max(abs(a - b) for a, b in zip(campos(), kp1)) < 1e-3, "frame 60 shows keyframe 2 pose")
+frame([0x24]); frame()
+for _ in range(30): frame([0x27]); frame()
+mid = campos()
+check(min(kp0[i], kp1[i]) - 0.01 <= mid[i] <= max(kp0[i], kp1[i]) + 0.01 for i in range(3)) if False else None
+check(all(min(kp0[i], kp1[i]) - 0.01 <= mid[i] <= max(kp0[i], kp1[i]) + 0.01 for i in range(3))
+      and mid != kp0 and mid != kp1, "frame 30 interpolates between keys %s" % mid)
+frame([0x21]); frame()
+check("SELECTED 1" in hudline("KEYFRAMES") and shown() == 0, "PgUp selects keyframe 1 and seeks (%s)" % shown())
+# Tab must start the free camera from the camera on screen, not the last free pose
+for _ in range(30): frame([0x27]); frame()
+onscreen = campos()
+frame([0x09]); frame()
+check("CAM FREE" in (status_line() or "") and max(abs(a - b) for a, b in zip(campos(), onscreen)) < 1e-3,
+      "Tab again starts from the on-screen (keyframe path) camera %s" % campos())
+frame([0x09]); frame([0x21]); frame()
+
+frame([ord('B')]); frame()
+for _ in range(30): frame([0x27]); frame()
+check(max(abs(a - b) for a, b in zip(campos(), kp0)) < 1e-3, "B (cut) holds keyframe 1 until keyframe 2")
+frame([0x21]); frame([ord('T')]); frame()
+order = [hudline("KEYFRAMES")]
+frame([ord('T')]); frame(); order.append(hudline("KEYFRAMES"))
+frame([ord('T')]); frame(); order.append(hudline("KEYFRAMES"))
+check("RECORDED CAMERA" in order[0] and "FOLLOW PLAYER" in order[1] and "LOOK AT PLAYER" in order[2],
+      "T order from FREE: RECORDED -> FOLLOW -> LOOK AT PLAYER")
+check("LOOK AT PLAYER" in hudline("KEYFRAMES"), "T -> LOOK AT PLAYER: %s" % hudline("KEYFRAMES"))
+for _ in range(10): frame([0x27]); frame()
+fw, pc, pl = camfwd(), campos(), player(shown())
+d = [pl[0] - pc[0], pl[1] - pc[1], pl[2] + 0.6 - pc[2]]
+n = math.sqrt(sum(x * x for x in d)); d = [x / n for x in d]
+check(sum(a * b for a, b in zip(fw, d)) > 0.999, "LOOK AT aims at the recorded player")
+# K: new keyframe inherits the previous keyframe's type; toast feedback
+frame([0x09]); frame()                       # free cam on
+for _ in range(10): frame([0x27]); frame()   # frame 20: between key 1 (LOOK) and key 2
+frame([ord('K')])
+toast = [t for t in state["text"] if t.startswith("KEYFRAME ") and ("ADDED" in t or "UPDATED" in t)]
+k1type = "LOOK AT PLAYER" if "LOOK" in hudline("KEYFRAMES") else ""
+check(toast and "ADDED" in toast[0], "K shows an ADDED toast: %s" % toast)
+check(toast and toast[0].endswith("LOOK AT PLAYER"), "new keyframe inherits previous type (LOOK AT PLAYER): %s" % toast)
+frame(); frame([ord('K')])
+toast = [t for t in state["text"] if t.startswith("KEYFRAME ")]
+check(toast and "UPDATED" in toast[0], "K again on the same frame shows UPDATED: %s" % toast)
+for _ in range(12): frame()
+check(bool([t for t in state["text"] if t.startswith("KEYFRAME ")]), "toast still visible after 0.4 s")
+for _ in range(5): frame()
+check(not [t for t in state["text"] if t.startswith("KEYFRAME ")], "toast gone after 0.56 s")
+frame([0x2E]); frame(); frame([0x09]); frame()
+frame([0x21]); frame(); frame([ord('T')]); frame(); frame([ord('T')]); frame()
+check("RECORDED CAMERA" in hudline("KEYFRAMES"), "T x2 more -> RECORDED")
+look_before = state.get("look", 0)
+for _ in range(5): frame([0x27]); frame()
+check(state.get("look", 0) > look_before and "CAM RECORDED" in (status_line() or ""), "RECORDED segment uses the game camera")
+frame([0x22]); frame([0x2E]); frame()
+check("KEYFRAMES 1" in hudline("KEYFRAMES"), "PgDn + Del deletes keyframe 2")
+frame([ord('P')]); frame()
+check("PLAYING" in (status_line() or "") and shown() <= 2, "P previews from the start")
+for _ in range(NFR + 50): frame()
+check(rd8(MODE) == 1 and not state["finished"], "preview runs to the end without finishing")
+exit_ed()
+check(rd8(MODE) == 1 and toast_with("UNSAVED CHANGES"), "F6 with unsaved changes asks first: %s" % toast_with("UNSAVED"))
+exit_ed()
+check(rd8(MODE) == 0 and abs(fget(0x696658) - 70.0) < 1e-4, "second F6 exits, FOV 70 restored")
+# ---------------- phase 4: trim, save, project -----------------------------
+import tempfile
+from reptrim import validate
+open_from_menu(0, "replay.rep")
+check(rd8(MODE) == 1 and "KEYFRAMES 0" in hudline("START"), "a .rep always opens as a new project: %s" % hudline("START"))
+frame([0x10, 0x27]); frame([0x10])
+check(shown() == 30, "at frame 30 (%s)" % shown())
+frame([ord('I')])
+check(toast_with("START - FRAME 31"), "I sets the start mark: %s" % toast_with("START"))
+frame()
+for _ in range(5): frame([0x10, 0x27]); frame([0x10])
+for _ in range(20): frame([0x27]); frame()
+check(shown() == 200, "at frame 200 (%s)" % shown())
+frame([ord('O')])
+check(toast_with("END - FRAME 201"), "O sets the end mark: %s" % toast_with("END"))
+frame([0x24]); frame()
+check(shown() == 30, "Home -> start mark (%s)" % shown())
+frame([0x23]); frame()
+check(shown() == 200, "End -> end mark (%s)" % shown())
+# keyframes at 50 and 150 with the free camera
+frame([0x24]); frame()
+for _ in range(20): frame([0x27]); frame()
+frame([0x09]); frame()
+for _ in range(10): frame([ord('W')])
+frame([ord('K')]); frame()
+keyA = campos()
+for _ in range(100): frame([0x27]); frame()
+for _ in range(15): frame([ord('D')])
+frame([ord('K')]); frame()
+keyB = campos()
+frame([0x09]); frame()
+check("KEYFRAMES 2" in hudline("START") and shown() == 150, "keyframes at 50 and 150")
+frame([0x09]); frame()
+check("CAM FREE" in status_line(), "free camera on again")
+frame([0x20]); frame()
+check("PLAYING" in status_line() and "CAM FREE" not in status_line(), "Space plays with the free camera turned off: %s" % status_line())
+frame([0x20]); frame()
+frame([0x09]); frame(); frame([ord('P')]); frame()
+check("PLAYING" in status_line() and "CAM FREE" not in status_line(), "P previews with the free camera turned off")
+frame([0x20]); frame(); frame([0x23]); frame(); frame([0x24]); frame()
+# ---------------- weather / time tracks ---------------------------------------
+W_OLD, W_NEW, W_U, C_H, C_M, C_S = 0xA10AAA, 0xA10A2E, 0x9787D8, 0xA10B6B, 0xA10B92, 0xA10A3C
+def rd16(a): return struct.unpack("<h", bytes(uc.mem_read(a, 2)))[0]
+def wr16(a, v): uc.mem_write(a, struct.pack("<h", v))
+def goto(fr):
+    while shown() < fr: frame([0x27]); frame()
+    while shown() > fr: frame([0x25]); frame()
+wr16(W_OLD, 0); wr16(W_NEW, 0); fset(W_U, 0.0); wr8(C_H, 12); wr8(C_M, 0); wr16(C_S, 0)
+frame([0x28]); frame()
+check("WEATHER KEYS 0" in hudline("START"), "Down selects the weather track: %s" % hudline("START"))
+goto(60)
+frame([ord('K')])
+check(toast_with("WEATHER KEY 1 ADDED - FRAME 61 - SUNNY"), "K adds a weather key with the current weather: %s" % toast_with("WEATHER"))
+frame(); frame([ord('T')]); frame(); frame([ord('T')])
+check(toast_with("WEATHER KEY 1 - FRAME 61 - RAINY"), "T cycles the weather type: %s" % toast_with("WEATHER"))
+frame()
+check(rd16(W_OLD) == 2 and rd16(W_NEW) == 2, "weather applied at the key (RAINY)")
+goto(120)
+frame([ord('K')]); frame(); frame([0xBE])
+check(toast_with("WEATHER KEY 2 - FRAME 121 - FOGGY"), "K at 120 + '.' -> FOGGY: %s" % toast_with("WEATHER"))
+frame()
+check(rd16(W_OLD) == 3 and rd16(W_NEW) == 3, "after the last key the weather holds FOGGY")
+# [ / ]: move the selected key one frame
+frame([0xDB])
+check(toast_with("WEATHER KEY 2 MOVED TO FRAME 120") and shown() == 119, "[ moves the selected key one frame back and follows it (%s)" % shown())
+frame(); frame([0xDD])
+check(toast_with("WEATHER KEY 2 MOVED TO FRAME 121") and shown() == 120, "] moves it forward again")
+frame(); goto(121); frame([ord('K')]); frame()
+frame([0x21]); frame()
+check("SELECTED 2: FRAME 121" in hudline("START"), "PgUp selects key 2 again")
+frame([0xDD])
+check(toast_with("CANNOT MOVE - FRAME 122 ALREADY HAS A KEYFRAME"), "blocked by the next key: %s" % toast_with("CANNOT"))
+check("SELECTED 2: FRAME 121" in hudline("START"), "the blocked key did not move")
+for _ in range(12): frame()
+check(toast_with("CANNOT MOVE"), "message still visible after 0.4 s")
+for _ in range(5): frame()
+check(not toast_with("CANNOT MOVE"), "message gone after 0.56 s")
+frame([0x22]); frame(); frame([0x2E]); frame()
+check("WEATHER KEYS 2" in hudline("START"), "helper key removed again")
+goto(120)
+goto(90)
+check(rd16(W_OLD) == 2 and rd16(W_NEW) == 3 and abs(fget(W_U) - 0.5) < 0.02, "SMOOTH: RAINY -> FOGGY blend 0.5 at frame 90 (%.3f)" % fget(W_U))
+check("RAINY" in status_line() or "FOGGY" in status_line(), "status line shows the weather: %s" % status_line())
+goto(40)
+wr16(W_OLD, 1); wr16(W_NEW, 1); frame()
+check(rd16(W_OLD) == 1, "before the first weather key the recorded weather is kept")
+# time track
+frame([0x28]); frame()
+check("TIME KEYS 0" in hudline("START"), "Down again selects the time track")
+goto(60)
+frame([ord('K')])
+_h, _m = rec_clock(60); B = _h * 60 + _m                # the clock is the recorded one here
+def hm(m): m %= 1440; return "%02d:%02d" % (m // 60, m % 60)
+def clk(): return rd8(C_H) * 60 + rd8(C_M)
+check(toast_with("TIME KEY 1 ADDED - FRAME 61 - " + hm(B)), "K adds a time key with the current (recorded) clock: %s" % toast_with("TIME"))
+frame(); frame([0x10, 0xBE]); frame([0x10])
+check(toast_with("TIME KEY 1 - FRAME 61 - " + hm(B + 60)), "Shift+'.' -> +1 hour: %s" % toast_with("TIME"))
+goto(120)
+frame([ord('K')]); frame()
+for _ in range(10): frame([0x10, 0xBE]); frame([0x10])
+frame([0xBC]); frame()
+check("SELECTED 2: FRAME 121  " + hm(B + 650) in hudline("START"), "key 2 = key 1 + 10 h - 10 min = %s: %s" % (hm(B + 650), hudline("START")))
+goto(90)
+check(clk() == (B + 355) % 1440, "SMOOTH time lapse: %s -> %s, frame 90 = %s (%s)" % (hm(B + 60), hm(B + 650), hm(B + 355), hm(clk())))
+frame([0x21]); frame([ord('B')]); frame(); goto(90)
+check(clk() == (B + 60) % 1440, "CUT: holds %s until the next key (%s)" % (hm(B + 60), hm(clk())))
+frame([ord('B')]); frame()
+goto(150)
+frame([ord('K')]); frame()
+for _ in range(4): frame([0x10, 0xBE]); frame([0x10])
+check("SELECTED 3: FRAME 151  " + hm(B + 890) in hudline("START"), "key 3 = key 2 + 4 h: %s" % hudline("START"))
+goto(135)
+check(clk() == (B + 770) % 1440, "time runs forward (across midnight when needed): %s -> %s, frame 135 = %s (%s)" % (hm(B + 650), hm(B + 890), hm(B + 770), hm(clk())))
+frame([0x2E]); frame()
+check("TIME KEYS 2" in hudline("START"), "Del removes the selected time key")
+frame([0x26]); frame(); frame([0x26]); frame()
+check("KEYFRAMES 2" in hudline("START"), "Up, Up -> back on the camera track: %s" % hudline("START"))
+frame([0xDD])
+check(toast_with("KEYFRAME 2 MOVED TO FRAME 152") and "SELECTED 2: FRAME 152" in hudline("START"), "] moves the selected camera key: %s" % toast_with("KEYFRAME"))
+frame(); frame([0xDB]); frame()
+check("SELECTED 2: FRAME 151" in hudline("START"), "[ moves it back")
+frame([0x24]); frame()
+frame([ord('P')]); frame()
+for _ in range(400): frame()
+check(shown() == 200 and "PAUSED" in status_line() and rd8(MODE) == 1, "preview plays start->end mark and stops (%s)" % shown())
+frame([0x76])
+check(toast_with("SAVED replay.edit.prj - 2 KEYFRAMES, 171 FRAMES"), "F7 saves the project: %s" % toast_with("SAVED"))
+frame()
+check(("docs", "replay.edit.rep") not in FS, "F7 no longer writes replay.edit.rep")
+check(("docs", "replay.edit.prj") in FS, "replay.edit.prj written in the user folder")
+src_bytes = bytes(FS[("docs", "replay.rep")])
+pj = bytes(FS[("docs", "replay.edit.prj")])
+ENV = 4 + 8 * 2 + 4 + 8 * 2          # weather keys (2) + time keys (2), 8 bytes each
+check(struct.unpack_from("<I", pj, 4)[0] == 4 and len(pj) == 292 + 48 * 2 + ENV + 4 + len(src_bytes)
+      and pj[292 + 96 + ENV + 4:] == src_bytes, "project v4: keys + weather/time keys + the source replay byte for byte (%d bytes)" % len(pj))
+check(fsstate["cwd"] == "root", "directory restored after saving")
+frame([0x76]); frame()
+check(not [k for k in FS if k[1].endswith(".bak")] and bytes(FS[("docs", "replay.edit.prj")]) == pj,
+      "second save overwrites, no .bak")
+check("UNSAVED" not in (status_line() or ""), "saved -> not marked unsaved")
+exit_ed()
+check(rd8(MODE) == 0, "F6 exits at once after saving")
+names = open_from_menu(0, "replay.edit.prj")
+check(names[:2] == ["replay.edit.prj", "replay.rep"], "new file listed first: %s" % names)
+check(shown() == 30 and "PAUSED" in status_line(), "a trimmed project opens on its start mark (%s)" % shown())
+check(loaded_by("ReplayEditor.tmp") and toast_with("PROJECT LOADED - 2 KEYFRAMES - replay.rep"),
+      "OPEN .prj loads the replay inside it with 2 keyframes (%s)" % loaded["name"])
+check(("docs", "ReplayEditor.tmp") not in FS and fsstate["cwd"] == "root", "temporary replay file deleted")
+frame([0x28]); frame()
+check("WEATHER KEYS 2" in hudline("START"), "weather keys restored from the project")
+frame([0x28]); frame()
+check("TIME KEYS 2" in hudline("START"), "time keys restored from the project")
+frame([0x26]); frame(); frame([0x26]); frame()
+frame([0x24]); frame()
+check(shown() == 30, "start mark restored (%s)" % shown())
+frame([0x23]); frame()
+check(shown() == 200, "end mark restored (%s)" % shown())
+frame([0x76]); frame()
+check(toast_with("SAVED replay.edit.prj"), "saving from the project keeps the name replay.edit.prj")
+exit_ed()
+# PLAY .rep: plain game playback of that file
+open_from_menu(1, "replay.rep")
+check(rd8(MODE) == 1 and (loaded["name"] == "replay.rep" or LONG) and status_line() is None and rd32(0x61F0EE) == 0x6DB604,
+      "PLAY .rep: playback of replay.rep, no editor (%s)" % ("window player" if LONG else "game loader"))
+for _ in range(5): frame()
+check(state["stdcam"] == 0, "PLAY .rep: the game's live camera stays off (file camera shown)")
+uc.mem_write(pad_area + 0x6C, b"\xff\x00"); frame()
+check(not any(uc.mem_read(pad_area + 0x6C, 0x7E)), "PLAY .rep: key presses dropped during playback")
+wr8(MODE, 0); uc.mem_write(pad_area + 0x6C, b"\xff\x00"); frame()
+check(not any(uc.mem_read(pad_area + 0x6C, 0x7E)), "PLAY .rep ended by the game: pad input cleared")
+# PLAY .prj: source + project applied live, stops at the end mark
+open_from_menu(1, "replay.edit.prj")
+seen, nplay, envseen = [], 0, set()
+while rd8(MODE) == 1 and nplay < 400:
+    seen.append(campos()); envseen.add((rd16(W_OLD), rd16(W_NEW), rd8(C_H))); nplay += 1; frame()
+check(status_line() is None and 160 <= nplay <= 180 and not state["finished"],
+      "PLAY .prj: no HUD, plays start->end mark then returns to the game (%d frames)" % nplay)
+check(any(max(abs(a - b) for a, b in zip(c, keyA)) < 1e-3 for c in seen), "PLAY .prj shows the keyframe camera")
+check(not any(c[0] == 9999.0 for c in seen), "PLAY .prj: never overwritten by the game's live camera")
+check((3, 3, (B + 650) // 60 % 24) in envseen and (2, 3, (B + 355) // 60 % 24) in envseen, "PLAY .prj applies the weather and time tracks")
+# the project works without its .rep
+saved_rep = FS.pop(("docs", "replay.rep"))
+for _ in range(100): frame()
+names = open_from_menu(0, "replay.edit.prj")
+check("replay.rep" not in names and rd8(MODE) == 1 and toast_with("PROJECT LOADED - 2 KEYFRAMES"),
+      "replay.rep deleted: replay.edit.prj still opens")
+frame([0x24]); frame()
+check(shown() == 30 and "KEYFRAMES 2" in hudline("START"), "keyframes and start mark restored without the .rep")
+frame([0x76]); frame()
+check(bytes(FS[("docs", "replay.edit.prj")])[292 + 96 + ENV + 4:] == src_bytes, "saving again keeps the embedded replay")
+exit_ed()
+open_from_menu(1, "replay.edit.prj")
+nplay = 0
+while rd8(MODE) == 1 and nplay < 400: nplay += 1; frame()
+check(160 <= nplay <= 180, "PLAY .prj works without the .rep (%d frames)" % nplay)
+FS[("docs", "replay.rep")] = saved_rep
+# old v2 project (no replay inside) still loads from its .rep
+v2 = bytearray(FS[("docs", "replay.edit.prj")][:292 + 96]); struct.pack_into("<I", v2, 4, 2)
+FS[("docs", "old.edit.prj")] = v2; touch(("docs", "old.edit.prj"))
+open_from_menu(0, "old.edit.prj")
+check(rd8(MODE) == 1 and loaded_by("replay.rep") and toast_with("PROJECT LOADED - 2 KEYFRAMES"),
+      "old v2 project loads its replay.rep")
+exit_ed()
+# a project whose replay was re-recorded is refused
+pj = FS[("docs", "replay.edit.prj")]
+struct.pack_into("<I", pj, 8, struct.unpack_from("<I", pj, 8)[0] + 1)
+open_from_menu(0, "replay.edit.prj")
+check(rd8(MODE) == 0 and any("PROJECT DOES NOT MATCH" in t for t in state["text"]), "mismatching project refused")
+for _ in range(100): frame()
+# not a replay file / truncated file: refused before the game's loader runs
+FS[("docs", "bad.rep")] = bytearray(b"hello world, not a replay" * 10); touch(("docs", "bad.rep"))
+FS[("docs", "tiny.rep")] = bytearray(b"gtaVC7f\0" + bytes(10)); touch(("docs", "tiny.rep"))
+nloads = len(state.get("loads", []))
+open_from_menu(1, "bad.rep")
+check(rd8(MODE) == 0 and any(t.startswith("NOT A VICE CITY REPLAY FILE") for t in state["text"])
+      and len(state.get("loads", [])) == nloads, "bad header refused before loading")
+for _ in range(100): frame()
+open_from_menu(0, "tiny.rep")
+check(rd8(MODE) == 0 and any(t.startswith("REPLAY FILE HAS A BAD SIZE") for t in state["text"]), "truncated file refused")
+for _ in range(100): frame()
+# mission in progress: warning, second Enter loads
+wr32(0x978748, 0x40); wr32(0x821280 + 0x40, 1)
+frame([0x75]); frame(); frame([0x0D]); frame()
+check(any(t.startswith("WARNING: A MISSION IS IN PROGRESS") for t in state["text"]), "mission: warning shown in the list")
+names = list_names()
+for _ in range(names.index("replay.rep")): frame([0x28]); frame()
+frame([0x0D]); frame()
+check(rd8(MODE) == 0 and any("PRESS ENTER AGAIN" in t for t in state["text"]), "mission: first Enter only asks")
+frame([0x0D]); frame()
+check(rd8(MODE) == 1 and status_line() is not None, "mission: second Enter opens the editor")
+exit_ed()
+wr32(0x821280 + 0x40, 0)
+frame([0x75]); frame(); frame([0x0D]); frame()
+check(not any(t.startswith("NOTE:") for t in state["text"]) and not any("MISSION" in t for t in state["text"]),
+      "no mission: no note / warning under the list")
+rows = [t for t in state["text"] if t.endswith(" KB")]
+check(len(rows) == len(list_names()) and not any("PROJECT" in t or "REPLAY" in t or "KEYS" in t for t in state["text"][1:]),
+      "every row (.rep and .prj) shows only size + date: %s" % rows[:4])
+frame([0x75]); frame()
+print("playback calls:", state["plays"])
+print("RESULT:", "PASS" if not fails else "FAIL %d" % len(fails))
+sys.exit(1 if fails else 0)
