@@ -9,8 +9,8 @@ Native module native/replayeditor.c -> CLEO/ReplayEditor/ReplayEditor.dll,
 loaded by the script (0AA2/0AA4/0AA7 RE_Init): F6 menu (open in editor /
 play replay, file list of the user folder), editor, F7 save.
 
-Outputs: ../CLEO/ReplayEditor.cs, ../CLEO/ReplayEditor.ini (kept if present),
-         ../CLEO/ReplayEditor/ReplayEditor.dll
+Outputs: <game>/CLEO/ReplayEditor.cs, <game>/CLEO/ReplayEditor.ini (kept if present),
+         <game>/CLEO/ReplayEditor/ReplayEditor.dll  (<game> = GTA_VC_DIR or D:/GTA ViceCity/GTA VC)
 """
 import os
 import shutil
@@ -20,7 +20,9 @@ import sys
 from scm import Scm, L, IF
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT_CLEO = os.path.join(HERE, "..", "CLEO")
+# the game folder (outputs go to its CLEO folder); GTA_VC_DIR overrides it
+GAME_DIR = os.environ.get("GTA_VC_DIR", r"D:\GTA ViceCity\GTA VC")
+OUT_CLEO = os.path.join(GAME_DIR, "CLEO")
 
 # --- gta-vc.exe v1.0 patch sites (verified with REA/Ghidra) ----------------
 LOOK_DEC = 0x61EA8B          # FF 0D 48 DD 94 00   dec dword [0x94DD48]
