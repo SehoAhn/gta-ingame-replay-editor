@@ -70,7 +70,7 @@ To watch the result, choose F6 → PLAY REPLAY and pick the `.prj` (trim, camera
 | | [ / ] | Move the selected keyframe one frame back / forward (all tracks; does nothing if that frame already has a key) |
 | | PgUp / PgDn | Select the previous / next keyframe |
 | | T | Change type: RECORDED CAMERA → FOLLOW PLAYER → LOOK AT PLAYER → FOLLOW & LOOK AT PLAYER → FREE |
-| | B | SMOOTH / CUT to the next keyframe |
+| | B / Shift+B | Interpolation to the next keyframe, forward / backward: SMOOTH → LINEAR → EASE IN → EASE OUT → EASE IN-OUT → CONSTANT SPEED → CUT (see below) |
 | | P | Preview from the start mark |
 | Tracks | ↑ / ↓ | Select the track to edit: CAMERA / WEATHER / TIME (/ SUB 1 … SUB 9 for the sub replays added) — K, Del, PgUp/PgDn and B apply to the selected track |
 | | N | Add a sub replay (up to 9): pick a `.rep` from the user folder; its track (SUB 1, SUB 2, …) appears and is selected |
@@ -87,12 +87,31 @@ To watch the result, choose F6 → PLAY REPLAY and pick the `.prj` (trim, camera
 | Other | H | Show / hide help (closed at start) |
 | | F6 | Exit the editor |
 
+### Interpolation (B)
+
+Each keyframe sets how the camera moves from it to the next keyframe:
+
+| Type | Movement to the next keyframe |
+|---|---|
+| SMOOTH | Smooth curve through the keyframes (default) |
+| LINEAR | Straight line at a steady speed; changes direction sharply at the keyframes |
+| EASE IN | Starts from a standstill and speeds up |
+| EASE OUT | Slows down and stops at the next keyframe |
+| EASE IN-OUT | Starts and stops at a standstill |
+| CONSTANT SPEED | The SMOOTH curve at an even speed along the path (no speeding up / slowing down when keyframes are unevenly spaced) |
+| CUT | Holds this keyframe, then jumps to the next one |
+
+The easing types also apply to the direction, roll and field of view. On the CAMERA lane, segments other than SMOOTH have a
+thin speed bar (bright = fast, dark = slow). Projects from older versions open unchanged (SMOOTH / CUT).
+
 ### Weather / time tracks
 
 - The bottom timeline has three lanes — CAMERA · WEATHER · TIME — and the selected track name is orange.
-- Weather: with SMOOTH it changes gradually to the next key using the game's weather transition; with CUT (B) it switches at the next key.
-- Time: with SMOOTH the clock runs until the next key's time (time-lapse, always forward — it can pass midnight, e.g. 23:00 → 02:00);
+- Weather: with LINEAR it changes gradually to the next key using the game's weather transition; with CUT it switches at the next key.
+- Time: with LINEAR the clock runs until the next key's time (time-lapse, always forward — it can pass midnight, e.g. 23:00 → 02:00);
   with CUT it stays at that time until the next key.
+- B / Shift+B on these tracks: LINEAR → EASE IN → EASE OUT → EASE IN-OUT → CUT (the easing types make the weather change or
+  the time-lapse start slowly and/or end slowly).
 - Before the first key, the recorded weather and time are used. The status line shows the current weather and time.
 - Weather and time are saved in the `.prj` and applied in the editor and in PLAY REPLAY → `.prj` playback.
 

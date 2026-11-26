@@ -190,6 +190,40 @@ static float catmull(float p0, float p1, float p2, float p3, float u)
     return 0.5f * (2 * p1 + (-p0 + p2) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u2 + (-p0 + 3 * p1 - 3 * p2 + p3) * u3);
 }
 
+/* interpolation of a segment (key -> next key), stored in the key's 'cut' byte:
+   0 / 1 keep their old meaning (SMOOTH / CUT) so older projects load unchanged */
+enum { IP_SMOOTH, IP_CUT, IP_LINEAR, IP_EASEIN, IP_EASEOUT, IP_EASEINOUT, IP_CONST, IP_N };
+static const char *IP_NAME[IP_N] = { "SMOOTH", "CUT", "LINEAR", "EASE IN", "EASE OUT", "EASE IN-OUT", "CONSTANT SPEED" };
+/* B order: camera SMOOTH > LINEAR > EASE IN > EASE OUT > EASE IN-OUT > CONSTANT SPEED > CUT
+            weather / time (value 0 = linear there) LINEAR > EASE IN > EASE OUT > EASE IN-OUT > CUT */
+static const u8 IP_CAM_ORDER[] = { IP_SMOOTH, IP_LINEAR, IP_EASEIN, IP_EASEOUT, IP_EASEINOUT, IP_CONST, IP_CUT };
+static const u8 IP_ENV_ORDER[] = { IP_SMOOTH, IP_EASEIN, IP_EASEOUT, IP_EASEINOUT, IP_CUT };
+static int ip_next(int cur, int env, int dir)
+{
+    const u8 *o = env ? IP_ENV_ORDER : IP_CAM_ORDER;
+    int n = env ? (int)sizeof(IP_ENV_ORDER) : (int)sizeof(IP_CAM_ORDER), i;
+    for (i = 0; i < n && o[i] != cur; i++) {}
+    if (i == n) i = 0;
+    return o[(i + dir + n) % n];
+}
+static const char *ip_name(int ip, int env) { return env && ip == IP_SMOOTH ? "LINEAR" : IP_NAME[ip < IP_N ? ip : 0]; }
+/* progress through the segment for the easing types */
+static float ease(int ip, float u)
+{
+    if (ip == IP_EASEIN) return u * u;
+    if (ip == IP_EASEOUT) return 1.0f - (1.0f - u) * (1.0f - u);
+    if (ip == IP_EASEINOUT) return u * u * (3.0f - 2.0f * u);
+    return u;
+}
+/* its speed (derivative) for the lane's speed bar */
+static float ease_speed(int ip, float u)
+{
+    if (ip == IP_EASEIN) return 2.0f * u;
+    if (ip == IP_EASEOUT) return 2.0f * (1.0f - u);
+    if (ip == IP_EASEINOUT) return 6.0f * u * (1.0f - u);
+    return 1.0f;
+}
+
 /* ---------------------------------------------------------------- string */
 static int slen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static char *sput(char *d, const char *s) { while (*s) *d++ = *s++; *d = 0; return d; }
@@ -669,32 +703,59 @@ static void delete_key(int i)
 }
 
 /* camera for fractional frame t; 0 = no override (recorded camera) */
+/* spline through p1 -> p2, or a straight line (LINEAR) */
+static float seg_interp(float p0, float p1, float p2, float p3, float u, int lin)
+{
+    return lin ? p1 + (p2 - p1) * u : catmull(p0, p1, p2, p3, u);
+}
+
 static int eval_path(float t, Pose *out)
 {
-    int i, i0, i2, i3, type, k;
+    int i, i0, i2, i3, type, k, ip, fol, lin;
     float u = 0, pl[3], tgt[3];
     const Key *a, *b, *c, *d;
     if (nkf == 0 || t < (float)kf[0].frame) return 0;
     for (i = 0; i + 1 < nkf && (float)kf[i + 1].frame <= t; i++) {}
     type = kf[i].type;
     if (type == KF_RECORDED) return 0;
-    if (i + 1 < nkf && !kf[i].cut) u = (t - (float)kf[i].frame) / (float)(kf[i + 1].frame - kf[i].frame);
+    ip = kf[i].cut < IP_N ? kf[i].cut : IP_SMOOTH;
+    if (i + 1 < nkf && ip != IP_CUT) u = (t - (float)kf[i].frame) / (float)(kf[i + 1].frame - kf[i].frame);
     i0 = i > 0 ? i - 1 : i;
     i2 = i + 1 < nkf ? i + 1 : i;
     i3 = i + 2 < nkf ? i + 2 : i2;
-    if (u == 0) { i0 = i2 = i3 = i; }
+    if (i + 1 >= nkf || ip == IP_CUT) { i0 = i2 = i3 = i; u = 0; }
     a = &kf[i0]; b = &kf[i]; c = &kf[i2]; d = &kf[i3];
+    fol = type == KF_FOLLOW || type == KF_FOLLOWLOOK;
+    lin = ip == IP_LINEAR;
+    if (ip == IP_CONST && u > 0) {                 /* constant speed along the path: arc-length table */
+        float len[17], q[3], prev[3], tot = 0, want;
+        int s;
+        for (s = 0; s <= 16; s++) {
+            float us = (float)s / 16.0f;
+            for (k = 0; k < 3; k++)
+                q[k] = fol ? catmull(a->off[k], b->off[k], c->off[k], d->off[k], us) : catmull(a->p.pos[k], b->p.pos[k], c->p.pos[k], d->p.pos[k], us);
+            if (s) { float dv[3]; dv[0] = q[0] - prev[0]; dv[1] = q[1] - prev[1]; dv[2] = q[2] - prev[2]; tot += fsqrt_(vdot(dv, dv)); }
+            len[s] = tot;
+            prev[0] = q[0]; prev[1] = q[1]; prev[2] = q[2];
+        }
+        if (tot > 0.05f) {                         /* hardly moving (only turning): keep u */
+            want = u * tot;
+            for (s = 1; s < 16 && len[s] < want; s++) {}
+            u = ((float)(s - 1) + (len[s] > len[s - 1] ? (want - len[s - 1]) / (len[s] - len[s - 1]) : 0.0f)) / 16.0f;
+            u = fclamp(u, 0.0f, 1.0f);
+        }
+    } else u = ease(ip, u);
     player_pos(t, pl);
     for (k = 0; k < 3; k++) {
-        if (type == KF_FOLLOW || type == KF_FOLLOWLOOK) out->pos[k] = pl[k] + catmull(a->off[k], b->off[k], c->off[k], d->off[k], u);
-        else out->pos[k] = catmull(a->p.pos[k], b->p.pos[k], c->p.pos[k], d->p.pos[k], u);
+        if (fol) out->pos[k] = pl[k] + seg_interp(a->off[k], b->off[k], c->off[k], d->off[k], u, lin);
+        else out->pos[k] = seg_interp(a->p.pos[k], b->p.pos[k], c->p.pos[k], d->p.pos[k], u, lin);
     }
-    out->roll = catmull(a->p.roll, b->p.roll, c->p.roll, d->p.roll, u);
-    out->fov = fclamp(catmull(a->p.fov, b->p.fov, c->p.fov, d->p.fov, u), 5.0f, 170.0f);
+    out->roll = seg_interp(a->p.roll, b->p.roll, c->p.roll, d->p.roll, u, lin);
+    out->fov = fclamp(seg_interp(a->p.fov, b->p.fov, c->p.fov, d->p.fov, u, lin), 5.0f, 170.0f);
     if (type == KF_FREE || type == KF_FOLLOW) {   /* the keyframes' own direction */
         float y1 = b->p.yaw, y0 = wrap_near(a->p.yaw, y1), y2 = wrap_near(c->p.yaw, y1), y3 = wrap_near(d->p.yaw, y2);
-        out->yaw = catmull(y0, y1, y2, y3, u);
-        out->pitch = fclamp(catmull(a->p.pitch, b->p.pitch, c->p.pitch, d->p.pitch, u), -1.55f, 1.55f);
+        out->yaw = seg_interp(y0, y1, y2, y3, u, lin);
+        out->pitch = fclamp(seg_interp(a->p.pitch, b->p.pitch, c->p.pitch, d->p.pitch, u, lin), -1.55f, 1.55f);
     } else {
         tgt[0] = pl[0]; tgt[1] = pl[1]; tgt[2] = pl[2] + LOOK_Z;
         look_at(out, tgt);
@@ -902,7 +963,8 @@ static int env_seg(int tr, float t, int *i0, float *u)
     for (i = 0; i + 1 < n && (float)ek[tr][i + 1].frame <= t; i++) {}
     *i0 = i;
     *u = 0;
-    if (i + 1 < n && !ek[tr][i].cut) *u = (t - (float)ek[tr][i].frame) / (float)(ek[tr][i + 1].frame - ek[tr][i].frame);
+    if (i + 1 < n && ek[tr][i].cut != IP_CUT)
+        *u = ease(ek[tr][i].cut, (t - (float)ek[tr][i].frame) / (float)(ek[tr][i + 1].frame - ek[tr][i].frame));
     return 1;
 }
 
@@ -1474,7 +1536,10 @@ static int read_prj(const char *name, PrjHdr *h, Key *keys, u32 *rep_size, int w
                 for (j = 0; j < n; j++) {                  /* never trust file values */
                     short v = ld_ek[tr][j].val, mx = tr == 0 ? NWEATHER : 1440;
                     if (v < 0 || v >= mx) ld_ek[tr][j].val = 0;
-                    ld_ek[tr][j].cut = ld_ek[tr][j].cut ? 1 : 0;
+                    {   /* interpolation: linear / easing / CUT; anything else -> linear */
+                        u8 c = ld_ek[tr][j].cut;
+                        ld_ek[tr][j].cut = c == IP_CUT || c == IP_EASEIN || c == IP_EASEOUT || c == IP_EASEINOUT ? c : IP_SMOOTH;
+                    }
                     if (h->version < 5 && (ld_ek[tr][j].frame < 0 || ld_ek[tr][j].frame >= (int)h->nfr)) ld_ek[tr][j].frame = 0;
                 }
             }
@@ -1925,7 +1990,10 @@ static void open_project(const char *name, int viewer)
         return;
     }
     memcpy(kf, keys, sizeof(Key) * h.nkf);
-    { int i; for (i = 0; i < (int)h.nkf; i++) if (kf[i].type >= KF_NTYPES) kf[i].type = KF_FREE;   }   /* unknown type */
+    { int i; for (i = 0; i < (int)h.nkf; i++) {
+        if (kf[i].type >= KF_NTYPES) kf[i].type = KF_FREE;                     /* unknown type */
+        if (kf[i].cut >= IP_N) kf[i].cut = IP_SMOOTH;                          /* unknown interpolation */
+    } }
     memcpy(ek, ld_ek, sizeof(ek));
     nek[0] = ld_nek[0]; nek[1] = ld_nek[1];
     nkf = h.nkf;
@@ -3141,7 +3209,7 @@ static void env_toast(int tr, int i, const char *what)
     e = sput(line, tr == 0 ? "WEATHER KEY " : "TIME KEY "); e = iput(e, i + 1, 0);
     e = sput(e, what); e = iput(e, ek[tr][i].frame + 1, 0); e = sput(e, " - ");
     if (tr == 0) e = sput(e, WEATHER_NAME[ek[tr][i].val]); else e = hhmm(e, ek[tr][i].val);
-    if (ek[tr][i].cut) sput(e, "  CUT");
+    e = sput(e, "  "); sput(e, ip_name(ek[tr][i].cut, 1));
     message(line, 700);
 }
 
@@ -3190,7 +3258,7 @@ static void env_keys(int f, int shift)
             ed.dirty = 1; env_toast(tr, i, " - FRAME ");
         }
     }
-    if (pressed('B')) { k[i].cut = !k[i].cut; ed.dirty = 1; env_toast(tr, i, " - FRAME "); }
+    if (pressed('B')) { k[i].cut = (u8)ip_next(k[i].cut, 1, shift ? -1 : 1); ed.dirty = 1; env_toast(tr, i, " - FRAME "); }
 }
 
 static void __cdecl hk_update(void)
@@ -3320,7 +3388,13 @@ static void __cdecl hk_update(void)
     }
     if (ed.sel >= nkf) ed.sel = nkf - 1;
     if (pressed('T') && ed.sel >= 0) { kf[ed.sel].type = KF_NEXT[kf[ed.sel].type]; ed.dirty = 1; }
-    if (pressed('B') && ed.sel >= 0) { kf[ed.sel].cut = !kf[ed.sel].cut; ed.dirty = 1; }
+    if (pressed('B') && ed.sel >= 0) {
+        char line[80], *e;
+        kf[ed.sel].cut = (u8)ip_next(kf[ed.sel].cut, 0, key_now[0x10] ? -1 : 1);
+        ed.dirty = 1;
+        e = sput(line, "KEYFRAME "); e = iput(e, ed.sel + 1, 0); e = sput(e, ": "); sput(e, ip_name(kf[ed.sel].cut, 0));
+        message(line, 700);
+    }
 keys_done:
     if (pressed('P')) {                                    /* preview from the start mark */
         ed.freecam = 0;
@@ -3411,7 +3485,7 @@ static const char *HELP[] = {
     "                MOUSE: LOOK    Z/C: ROLL    R: RESET ROLL    -/=: ZOOM",
     "                SHIFT: FAST    CTRL: SLOW",
     "KEYFRAMES  K: ADD/UPDATE AT THIS FRAME    DEL: DELETE SELECTED    [ / ]: MOVE SELECTED -/+1 FRAME",
-    "                PGUP/PGDN: PREVIOUS/NEXT    T: TYPE    B: SMOOTH/CUT",
+    "                PGUP/PGDN: PREVIOUS/NEXT    T: TYPE    B / SHIFT+B: INTERPOLATION (SMOOTH, LINEAR, EASE.., CUT)",
     "                P: PREVIEW FROM START MARK",
     "TRACKS     UP/DOWN: SELECT TRACK (CAMERA / WEATHER / TIME / SUB 1..9)    N: ADD A SUB REPLAY (UP TO 9)",
     "                WEATHER  T OR ,/.: CHANGE TYPE        TIME  ,/.: -/+ 10 MIN (SHIFT: 1 HOUR)",
@@ -3491,16 +3565,22 @@ static void draw_lane(int tr, float x0, float x1, float y, int selected)
     for (i = 0; i < n; i++) {
         int fa = tr == TR_CAM ? kf[i].frame : ek[tr - 1][i].frame;
         int fb = i + 1 < n ? (tr == TR_CAM ? kf[i + 1].frame : ek[tr - 1][i + 1].frame) : nfr - 1;
-        int cut = tr == TR_CAM ? kf[i].cut : ek[tr - 1][i].cut, last = i + 1 >= n;
+        int ip = tr == TR_CAM ? kf[i].cut : ek[tr - 1][i].cut, last = i + 1 >= n, cut = ip == IP_CUT;
         float kx = frame_x((float)fa, x0, x1), nx = frame_x((float)fb, x0, x1);
         if (tr == TR_CAM) {
             const u8 *kc = KF_COL[kf[i].type];
             rect(kx, y + g_h * 0.005f, nx, yb - g_h * 0.005f, kc[0], kc[1], kc[2], cut ? 90 : 200);
+            if (!cut && !last && ip != IP_SMOOTH)          /* speed bar: bright = fast, dark = slow */
+                for (j = 0; j < 8; j++) {
+                    float sp = ease_speed(ip, ((float)j + 0.5f) / 8.0f) / 1.5f;
+                    int v = 40 + (int)(215.0f * fclamp(sp, 0.0f, 1.0f));
+                    rect(kx + (nx - kx) * (float)j / 8.0f, yb - g_h * 0.0045f, kx + (nx - kx) * (float)(j + 1) / 8.0f, yb - g_h * 0.0015f, (u8)v, (u8)v, (u8)v, 230);
+                }
             c[0] = kc[0]; c[1] = kc[1]; c[2] = kc[2];
         } else {
             const EKey *a = &ek[tr - 1][i], *b = last ? a : &ek[tr - 1][i + 1];
             for (j = 0; j < 8; j++) {                      /* 8 steps of the segment */
-                float u0 = (float)j / 8.0f, ua = cut || last ? 0.0f : u0;
+                float u0 = (float)j / 8.0f, ua = cut || last ? 0.0f : ease(ip, u0 + 0.0625f);
                 if (tr == TR_WEATHER) lerp_col(c, WEATHER_COL[a->val], WEATHER_COL[b->val], ua);
                 else time_col(c, cut || last ? (float)a->val : time_lerp(a->val, b->val, ua));
                 rect(kx + (nx - kx) * u0, y + g_h * 0.004f, kx + (nx - kx) * (u0 + 0.125f), yb - g_h * 0.004f, c[0], c[1], c[2], 210);
@@ -3554,7 +3634,7 @@ static void draw_editor_hud(void)
             e = sput(e, "    SELECTED "); e = iput(e, ed.sel + 1, 0);
             e = sput(e, ": FRAME "); e = iput(e, kf[ed.sel].frame + 1, 0);
             e = sput(e, "  "); e = sput(e, KF_NAME[kf[ed.sel].type]);
-            e = sput(e, kf[ed.sel].cut ? "  CUT" : "  SMOOTH");
+            e = sput(e, "  "); e = sput(e, ip_name(kf[ed.sel].cut, 0));
         }
         if (at >= 0) e = sput(e, "    [ON KEYFRAME]");
         if (ed.freecam) { e = sput(e, "    FOV "); iput(e, (int)(ed.fc.fov + 0.5f), 0); }
@@ -3574,7 +3654,7 @@ static void draw_editor_hud(void)
             e = sput(e, "    SELECTED "); e = iput(e, s2 + 1, 0);
             e = sput(e, ": FRAME "); e = iput(e, ek[t2][s2].frame + 1, 0); e = sput(e, "  ");
             e = t2 == 0 ? sput(e, WEATHER_NAME[ek[t2][s2].val]) : hhmm(e, ek[t2][s2].val);
-            sput(e, ek[t2][s2].cut ? "  CUT" : "  SMOOTH");
+            e = sput(e, "  "); sput(e, ip_name(ek[t2][s2].cut, 1));
         }
     }
     text(g_w * 0.05f, top + g_h * 0.045f * K, 0.75f, 210, 210, 210, line);

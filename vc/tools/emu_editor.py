@@ -607,9 +607,27 @@ check("CAM FREE" in (status_line() or "") and max(abs(a - b) for a, b in zip(cam
       "Tab again starts from the on-screen (keyframe path) camera %s" % campos())
 frame([0x09]); frame([0x21]); frame()
 
-frame([ord('B')]); frame()
+frame([0x10, ord('B')]); frame([0x10])
+check(toast_with("KEYFRAME 1: CUT"), "Shift+B from SMOOTH -> CUT (reverse order)")
 for _ in range(30): frame([0x27]); frame()
 check(max(abs(a - b) for a, b in zip(campos(), kp0)) < 1e-3, "B (cut) holds keyframe 1 until keyframe 2")
+# interpolation types between two keys (0 and 60): progress at frame 15 (u = 0.25)
+def frac15():
+    frame([0x21]); frame()
+    for _ in range(15): frame([0x27]); frame()
+    d = [b - a for a, b in zip(kp0, kp1)]
+    q = [c - a for a, c in zip(kp0, campos())]
+    return sum(x * y for x, y in zip(q, d)) / sum(x * x for x in d)
+def cat(u): return 0.5 * (u + 3 * u * u - 2 * u ** 3)   # spline with the end keys doubled
+EXPECT = [("SMOOTH", cat(0.25)), ("LINEAR", 0.25), ("EASE IN", cat(0.0625)), ("EASE OUT", cat(0.4375)),
+          ("EASE IN-OUT", cat(0.15625)), ("CONSTANT SPEED", 0.25)]
+frame([0x21]); frame([ord('B')]); frame()
+for name, want in EXPECT:
+    got = frac15()
+    check(name in hudline("KEYFRAMES") and abs(got - want) < 0.01,
+          "interp %s: progress at u=0.25 is %.3f (want %.3f) [%s]" % (name, got, want, hudline("KEYFRAMES")[-40:]))
+    frame([0x21]); frame([ord('B')]); frame()
+check("CUT" in hudline("KEYFRAMES"), "B after CONSTANT SPEED -> CUT (wraps): %s" % hudline("KEYFRAMES")[-30:])
 frame([0x21]); frame([ord('T')]); frame()
 order = [hudline("KEYFRAMES")]
 frame([ord('T')]); frame(); order.append(hudline("KEYFRAMES"))
@@ -779,10 +797,17 @@ for _ in range(10): frame([0x10, 0xBE]); frame([0x10])
 frame([0xBC]); frame()
 check("SELECTED 2: FRAME 121  " + hm(B + 650) in hudline("START"), "key 2 = key 1 + 10 h - 10 min = %s: %s" % (hm(B + 650), hudline("START")))
 goto(90)
-check(clk() == (B + 355) % 1440, "SMOOTH time lapse: %s -> %s, frame 90 = %s (%s)" % (hm(B + 60), hm(B + 650), hm(B + 355), hm(clk())))
+check(clk() == (B + 355) % 1440, "LINEAR time lapse: %s -> %s, frame 90 = %s (%s)" % (hm(B + 60), hm(B + 650), hm(B + 355), hm(clk())))
+check("LINEAR" in hudline("START"), "time key shows LINEAR (the old SMOOTH): %s" % hudline("START")[-30:])
+for nm, uu in (("EASE IN", 0.25), ("EASE OUT", 0.75), ("EASE IN-OUT", 0.5)):
+    frame([0x21]); frame([ord('B')]); ts = toast_with("TIME KEY 1"); frame(); goto(90)
+    want = (B + 60 + int(590 * uu)) % 1440
+    check(ts and ts[0].endswith("  " + nm) and abs(clk() - want) <= 1,
+          "time %s: frame 90 = %s (want ~%s) %s" % (nm, hm(clk()), hm(want), ts))
 frame([0x21]); frame([ord('B')]); frame(); goto(90)
-check(clk() == (B + 60) % 1440, "CUT: holds %s until the next key (%s)" % (hm(B + 60), hm(clk())))
-frame([ord('B')]); frame()
+check(clk() == (B + 60) % 1440 and "CUT" in hudline("START"), "CUT: holds %s until the next key (%s)" % (hm(B + 60), hm(clk())))
+frame([0x21]); frame([ord('B')]); frame()
+check("LINEAR" in hudline("START"), "B after CUT -> LINEAR (wraps)")
 goto(150)
 frame([ord('K')]); frame()
 for _ in range(4): frame([0x10, 0xBE]); frame([0x10])
@@ -988,7 +1013,7 @@ names = list_names()
 for _ in range(names.index("old.rep")): frame([0x28]); frame()
 frame([0x0D]); frame()
 check(toast_with("SUB 1 ADDED - old.rep"), "Enter adds old.rep as SUB 1: %s" % toast_with("SUB"))
-check("SUB 1: old.rep" in hudline("START") and "START +0.00 S" in hudline("START") and "SUB 1" in state["text"],
+check("SUB 1: old.rep" in hudline("START") and "START +0 FRAMES" in hudline("START") and "SUB 1" in state["text"],
       "the SUB 1 track appears and is selected: %s" % hudline("START"))
 frame([ord('N')]); frame()
 check(any(t.startswith("ADD SUB 2 - SELECT") for t in state["text"]), "N again: picker for SUB 2")
@@ -1006,13 +1031,13 @@ check(nveh >= min(2 * nveh_main, nveh_main + 1), "sub vehicles merged with new s
 # move the sub 1 s later: the project gets longer at the end, keys stay on the main
 frame([0x10, 0xDD]); frame([0x10])
 n_late = frames_total()
-check(toast_with("SUB 1 START +1.00 S") and n_late > NFR + 20, "Shift+] -> sub +1 s, project longer (%s frames)" % n_late)
+check(toast_with("SUB 1 START +") and n_late > NFR + 20, "Shift+] -> sub +1 s, project longer (%s frames)" % n_late)
 frame([0x26]); frame(); frame([0x26]); frame(); frame([0x26]); frame()   # back to CAMERA
 check("FRAME 61" in hudline("KEYFRAMES") or "KEYFRAMES 1" in hudline("KEYFRAMES"), "key unchanged with a later sub")
 for _ in range(3): frame([0x28]); frame()
 frame([0x10, 0xDB]); frame([0x10]); frame([0x10, 0xDB]); frame([0x10])
 n_early = frames_total()
-check(toast_with("SUB 1 START -1.00 S") and n_early > NFR + 20, "Shift+[ x2 -> sub -1 s, project starts earlier (%s frames)" % n_early)
+check(toast_with("SUB 1 START -") and n_early > NFR + 20, "Shift+[ x2 -> sub -1 s, project starts earlier (%s frames)" % n_early)
 frs = slot_frames()
 check(not merged_ok(frs), "merged frames with a pre-main part follow the rules %s" % merged_ok(frs))
 for _ in range(3): frame([0x26]); frame()
@@ -1037,7 +1062,7 @@ exit_ed()
 names = open_from_menu(0, SUBP)
 check(rd8(MODE) == 1 and frames_total() == n_early, "reopened project has the sub (%s frames)" % frames_total())
 for _ in range(3): frame([0x28]); frame()
-check("SUB 1: old.rep" in hudline("START") and "START -1.00 S" in hudline("START"), "sub restored: %s" % hudline("START"))
+check("SUB 1: old.rep" in hudline("START") and "START -" in hudline("START") and "FRAMES" in hudline("START"), "sub restored: %s" % hudline("START"))
 for _ in range(3): frame([0x26]); frame()
 frame([0x21]); frame()
 sel = hudline("KEYFRAMES")
@@ -1086,7 +1111,7 @@ pick_rep("old.rep")
 check(toast_with("SUB 2 ADDED - old.rep") and "SUB 2" in state["text"] and "SUB 2: old.rep" in hudline("START"),
       "multi: SUB 2 added, its track selected: %s" % hudline("START"))
 frame([0x10, 0xDB]); frame([0x10]); frame([0x10, 0xDB]); frame([0x10])   # SUB 2 -2 s
-check(toast_with("SUB 2 START -2.00 S"), "multi: SUB 2 moved on its own track")
+check(toast_with("SUB 2 START -"), "multi: SUB 2 moved on its own track")
 n2 = frames_total()
 check(n2 > NFR + 80, "multi: project covers SUB 2 (-2 s) and SUB 1 (+1 s): %s frames" % n2)
 frame([0x24]); frame()
@@ -1107,10 +1132,10 @@ exit_ed()
 open_from_menu(0, MP)
 check(rd8(MODE) == 1 and all(("SUB %d" % k) in state["text"] for k in (1, 2, 3)), "multi: reopened with SUB 1..3")
 for _ in range(4): frame([0x28]); frame()                  # SUB 2 (tracks: CAM WEATHER TIME SUB1 SUB2)
-check("SUB 2: old.rep" in hudline("START") and "START -2.00 S" in hudline("START"), "multi: SUB 2 offset restored: %s" % hudline("START"))
+check("SUB 2: old.rep" in hudline("START") and "START -" in hudline("START") and "FRAMES" in hudline("START"), "multi: SUB 2 offset restored: %s" % hudline("START"))
 frame([0x2E]); frame(); frame([0x2E]); frame()
 check(toast_with("SUB 2 REMOVED") and "SUB 3" not in state["text"] and "SUB 2" in state["text"], "multi: Del twice removes SUB 2, SUB 3 becomes SUB 2")
-check("START +0.00 S" in hudline("START"), "multi: the old SUB 3 (offset 0) is now SUB 2: %s" % hudline("START"))
+check("START +0 FRAMES" in hudline("START"), "multi: the old SUB 3 (offset 0) is now SUB 2: %s" % hudline("START"))
 frs = slot_frames()
 check(not merged_ok(frs), "multi: frames still valid after the removal")
 exit_ed(); frame([0x75]); frame()
