@@ -153,8 +153,6 @@ def install(out_cleo, built, data, fresh_ini):
     shutil.copyfile(os.path.join(HERE, "README.md"), os.path.join(out_dir, "README.md"))
     for k in range(1, 10):                                  # SUB 1 .. SUB 9 looks folders
         os.makedirs(os.path.join(out_dir, "Looks", "SUB%d" % k), exist_ok=True)
-        if fresh_ini:                                       # dist: keep the empty folders in git
-            open(os.path.join(out_dir, "Looks", "SUB%d" % k, ".gitkeep"), "w").close()
     with open(os.path.join(out_cleo, "ReplayEditor.cs"), "wb") as fh:
         fh.write(data)
     ini = os.path.join(out_cleo, "ReplayEditor.ini")

@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 vc/native/obj/
 *.bak
+.gitkeep
