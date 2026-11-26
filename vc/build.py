@@ -10,7 +10,9 @@ loaded by the script (0AA2/0AA4/0AA7 RE_Init): F6 menu (open in editor /
 play replay, file list of the user folder), editor, F7 save.
 
 Outputs: <game>/CLEO/ReplayEditor.cs, <game>/CLEO/ReplayEditor.ini (kept if present),
-         <game>/CLEO/ReplayEditor/ReplayEditor.dll  (<game> = GTA_VC_DIR or D:/GTA ViceCity/GTA VC)
+         <game>/CLEO/ReplayEditor/ReplayEditor.dll, README.md, Looks/SUB1..9
+         (<game> = GTA_VC_DIR or D:/GTA ViceCity/GTA VC), and the same under dist/CLEO
+         (with the default INI) for distribution
 """
 import os
 import shutil
@@ -23,6 +25,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # the game folder (outputs go to its CLEO folder); GTA_VC_DIR overrides it
 GAME_DIR = os.environ.get("GTA_VC_DIR", r"D:\GTA ViceCity\GTA VC")
 OUT_CLEO = os.path.join(GAME_DIR, "CLEO")
+# the same files for distribution: dist/CLEO/... (copy dist/CLEO into the game folder)
+DIST_CLEO = os.path.join(HERE, "dist", "CLEO")
 
 # --- gta-vc.exe v1.0 patch sites (verified with REA/Ghidra) ----------------
 LOOK_DEC = 0x61EA8B          # FF 0D 48 DD 94 00   dec dword [0x94DD48]
@@ -121,35 +125,40 @@ def build_script():
 
 
 def build_native():
+    """compile + link into native/obj; returns the built DLL's path"""
     src = os.path.join(HERE, "native", "replayeditor.c")
     obj_dir = os.path.join(HERE, "native", "obj")
-    out_dir = os.path.join(OUT_CLEO, "ReplayEditor")
     os.makedirs(obj_dir, exist_ok=True)
-    os.makedirs(out_dir, exist_ok=True)
     obj = os.path.join(obj_dir, "replayeditor.obj")
     built = os.path.join(obj_dir, "ReplayEditor.dll")
-    dll = os.path.join(out_dir, "ReplayEditor.dll")
     run = lambda args: subprocess.run(args, check=True, cwd=obj_dir)
     run([os.path.join(MSVC, "cl.exe"), "/nologo", "/c", "/O1", "/GS-", "/Zl", "/Oi-", "/W3",
          "/Gs1000000", "/fp:precise", "/Fo" + obj, src])
     run([os.path.join(MSVC, "link.exe"), "/nologo", "/DLL", "/NODEFAULTLIB", "/SAFESEH:NO",
          "/ENTRY:_DllMainCRTStartup", "/MACHINE:X86", "/OUT:" + built, obj])
     print("ReplayEditor.dll %d bytes" % os.path.getsize(built))
+    return built
+
+
+def install(out_cleo, built, data, fresh_ini):
+    """the mod's files into a CLEO folder: ReplayEditor.cs / .ini, ReplayEditor/ReplayEditor.dll,
+    README.md, Looks/SUB1..9; fresh_ini: always write the default INI"""
+    out_dir = os.path.join(out_cleo, "ReplayEditor")
+    os.makedirs(out_dir, exist_ok=True)
+    dll = os.path.join(out_dir, "ReplayEditor.dll")
     try:
         shutil.copyfile(built, dll)
     except PermissionError:
         print("WARNING: %s is in use (game running?) - close the game and run build.py again" % dll)
-
-
-def main():
-    build_native()
+    shutil.copyfile(os.path.join(HERE, "README.md"), os.path.join(out_dir, "README.md"))
     for k in range(1, 10):                                  # SUB 1 .. SUB 9 looks folders
-        os.makedirs(os.path.join(OUT_CLEO, "ReplayEditor", "Looks", "SUB%d" % k), exist_ok=True)
-    data = build_script()
-    with open(os.path.join(OUT_CLEO, "ReplayEditor.cs"), "wb") as fh:
+        os.makedirs(os.path.join(out_dir, "Looks", "SUB%d" % k), exist_ok=True)
+        if fresh_ini:                                       # dist: keep the empty folders in git
+            open(os.path.join(out_dir, "Looks", "SUB%d" % k, ".gitkeep"), "w").close()
+    with open(os.path.join(out_cleo, "ReplayEditor.cs"), "wb") as fh:
         fh.write(data)
-    ini = os.path.join(OUT_CLEO, "ReplayEditor.ini")
-    if not os.path.exists(ini) or "--reset-ini" in sys.argv:
+    ini = os.path.join(out_cleo, "ReplayEditor.ini")
+    if fresh_ini or not os.path.exists(ini):
         with open(ini, "w", newline="\r\n") as fh:
             fh.write(INI_TEXT + "\n" + INI_DISPLAY + "\n" + INI_KEYS)
     else:                                                               # older INI: add new sections
@@ -158,7 +167,15 @@ def main():
             if name not in old:
                 with open(ini, "a", newline="\r\n") as fh:
                     fh.write("\n" + sec)
+
+
+def main():
+    built = build_native()
+    data = build_script()
+    install(OUT_CLEO, built, data, "--reset-ini" in sys.argv)      # the game: keeps the user's INI
+    install(DIST_CLEO, built, data, True)                          # dist: default INI
     print("ReplayEditor.cs %d bytes" % len(data))
+    print("dist: %s" % DIST_CLEO)
 
 
 if __name__ == "__main__":
