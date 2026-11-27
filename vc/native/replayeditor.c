@@ -148,6 +148,10 @@ typedef u32 (__stdcall *GetFileSizeFn)(void *, u32 *);
 static GetFileSizeFn pGetFileSize;
 typedef int (__stdcall *DeleteFileAFn)(const char *);
 static DeleteFileAFn pDeleteFileA;
+typedef int (__stdcall *MoveFileAFn)(const char *, const char *);
+static MoveFileAFn pMoveFileA;
+typedef short (__stdcall *GetKeyStateFn)(int);
+static GetKeyStateFn pGetKeyState;
 typedef void (__stdcall *GetLocalTimeFn)(u16 *);   /* SYSTEMTIME */
 static GetLocalTimeFn pGetLocalTime;
 
@@ -825,19 +829,25 @@ static int parse_fkey(const char *v)
     return 0x6F + n;                                         /* VK_F1 = 0x70 */
 }
 
+static int g_typing;                       /* a FIND / RENAME text box is open: poll the typing keys too */
+static void poll_key(int k)
+{
+    key_prev[k] = key_now[k];
+    key_now[k] = pGetAsyncKeyState && (pGetAsyncKeyState(k) & 0x8000) ? 1 : 0;
+    key_hold[k] = key_now[k] ? key_hold[k] + 1 : 0;
+}
 static void poll_keys(void)
 {
     static const u8 used[] = { 0x08, 0x09, 0x0D, 0x10, 0x11, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26,
-                               0x27, 0x28, 0x2E, 0x31, 0x32, 0x33, 0x34, 0x35, 'A', 'B', 'C', 'D', 'E',
+                               0x27, 0x28, 0x2E, 0x31, 0x32, 0x33, 0x34, 0x35, 'A', 'B', 'C', 'D', 'E', 'F',
                                'H', 'I', 'K', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'W', 'Z', 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B,
                                0xBB, 0xBC, 0xBD, 0xBE, 0xDB, 0xDD };
+    static u8 inused[256];
     int i;
-    for (i = 0; i < (int)sizeof(used); i++) {
-        int k = used[i];
-        key_prev[k] = key_now[k];
-        key_now[k] = pGetAsyncKeyState && (pGetAsyncKeyState(k) & 0x8000) ? 1 : 0;
-        key_hold[k] = key_now[k] ? key_hold[k] + 1 : 0;
-    }
+    if (!inused[0x08]) for (i = 0; i < (int)sizeof(used); i++) inused[used[i]] = 1;
+    for (i = 0; i < (int)sizeof(used); i++) poll_key(used[i]);
+    if (g_typing)
+        for (i = 0x1B; i <= 0xDF; i++) if (!inused[i]) poll_key(i);
 }
 static int pressed(int k) { return key_now[k] && !key_prev[k]; }
 /* pressed, then auto-repeat after 12 frames every 2 frames */
@@ -2961,6 +2971,7 @@ static int sub_step(void) { int d = mnf > 1 ? (int)(mt[mnf - 1] - mt[0]) / (mnf 
 /* ------------------------------------------------------------------ menu */
 #define MAXFILES 160
 #define MENU_ROWS 12
+#define TI_MAX 100                     /* FIND / RENAME text length */
 typedef struct {
     char name[200];
     u32 ft[2];                         /* last write FILETIME */
@@ -2977,9 +2988,15 @@ static struct {
     u32 confirm_until;                 /* mission running: second Enter before this loads */
     int release_wait;                  /* closed: keep hiding keys until the menu keys are up */
     int del_confirm;                   /* DELETE: confirm box for files[sel] is up */
-    char note[120];                    /* DELETE: result line under the list */
+    char note[260];                    /* DELETE / RENAME: result line under the list */
     u32 note_until;
+    int finding;                       /* FIND: typing into find[] */
+    char find[TI_MAX + 1];             /* FIND: the list shows only names containing this (any case) */
+    int renaming, rn_i;                /* RENAME: box up for files[rn_i] */
+    char rn[TI_MAX + 1], rn_ext[8], rn_err[80];
 } menu;
+static short vis[MAXFILES];            /* the listed files (FIND filter): menu.sel / top index vis[] */
+static int nvis;
 #define MENU_ITEMS 3
 #define RE_VERSION "v1.02"                 /* shown at the right end of the F6 panel header */
 
@@ -3016,6 +3033,7 @@ static int newer(const FileEnt *a, const FileEnt *b)
     return a->ft[1] != b->ft[1] ? a->ft[1] > b->ft[1] : a->ft[0] > b->ft[0];
 }
 
+static void build_vis(const char *keep);
 static void list_files(int which)          /* 0 all, 1 .prj only, 2 .rep only */
 {
     static FileEnt tmp;
@@ -3030,6 +3048,157 @@ static void list_files(int which)          /* 0 all, 1 .prj only, 2 .rep only */
         for (j = i; j > 0 && newer(&tmp, &files[j - 1]); j--) files[j] = files[j - 1];
         files[j] = tmp;
     }
+    build_vis(0);
+}
+
+/* ------------------------------------------------ FIND / RENAME text box */
+static int same(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
+static int same_ci(const char *a, const char *b)
+{
+    while (*a && lower_(*a) == lower_(*b)) { a++; b++; }
+    return lower_(*a) == lower_(*b);
+}
+static int has_ci(const char *s, const char *w)              /* s contains w, any case */
+{
+    int i, j;
+    if (!*w) return 1;
+    for (i = 0; s[i]; i++) {
+        for (j = 0; w[j] && s[i + j] && lower_(s[i + j]) == lower_(w[j]); j++) ;
+        if (!w[j]) return 1;
+    }
+    return 0;
+}
+
+/* the listed files = files[] whose name contains menu.find; keep: name to stay selected */
+static void build_vis(const char *keep)
+{
+    int i, found = 0;
+    nvis = 0;
+    for (i = 0; i < nfiles; i++) if (has_ci(files[i].name, menu.find)) vis[nvis++] = (short)i;
+    if (keep) {
+        for (i = 0; i < nvis; i++) if (same(files[vis[i]].name, keep)) { menu.sel = i; found = 1; break; }
+        if (!found) { menu.sel = 0; menu.top = 0; }
+    }
+    if (menu.sel >= nvis) menu.sel = nvis - 1;
+    if (menu.sel < 0) menu.sel = 0;
+    if (menu.top > menu.sel) menu.top = menu.sel;
+    if (menu.sel >= menu.top + MENU_ROWS) menu.top = menu.sel - MENU_ROWS + 1;
+    if (menu.top < 0) menu.top = 0;
+}
+static const char *sel_name(void) { return nvis > 0 ? files[vis[menu.sel]].name : 0; }
+
+static int ti_cur;                                           /* cursor in the text being typed */
+static int ti_char(int vk)                                   /* typed character of a key, 0 = none */
+{
+    int shift = key_now[0x10], caps = pGetKeyState && (pGetKeyState(0x14) & 1);
+    if (vk >= 'A' && vk <= 'Z') return shift != caps ? vk : vk + 32;
+    if (vk >= 0x60 && vk <= 0x69) return '0' + vk - 0x60;   /* numpad */
+    if (vk == 0x20) return ' ';
+    if (vk == 0x6D) return '-';
+    if (vk == 0x6E) return '.';
+    if (shift) return vk == 0xBD ? '_' : 0;
+    if (vk >= '0' && vk <= '9') return vk;
+    if (vk == 0xBD) return '-';
+    if (vk == 0xBE) return '.';
+    return 0;                                                /* \ / : * ? " < > | cannot be typed */
+}
+/* edit s (cap bytes) with this frame's keys: 1 Enter, -1 Esc, 2 changed, 0 */
+static int ti_keys(char *s, int cap)
+{
+    int n = slen(s), k, c, i, ch = 0;
+    if (ti_cur > n) ti_cur = n;
+    if (pressed(0x0D)) return 1;
+    if (pressed(0x1B)) return -1;
+    if (repeat(0x25) && ti_cur > 0) ti_cur--;
+    if (repeat(0x27) && ti_cur < n) ti_cur++;
+    if (pressed(0x24)) ti_cur = 0;
+    if (pressed(0x23)) ti_cur = n;
+    if (repeat(0x08) && ti_cur > 0) { for (i = ti_cur - 1; i < n; i++) s[i] = s[i + 1]; ti_cur--; n--; ch = 1; }
+    if (repeat(0x2E) && ti_cur < n) { for (i = ti_cur; i < n; i++) s[i] = s[i + 1]; n--; ch = 1; }
+    for (k = 0x20; k <= 0xDF; k++) {
+        if (!repeat(k) || !(c = ti_char(k)) || n >= cap - 1) continue;
+        for (i = n; i >= ti_cur; i--) s[i + 1] = s[i];
+        s[ti_cur++] = (char)c; n++; ch = 1;
+    }
+    return ch ? 2 : 0;
+}
+/* s with the cursor '_' at ti_cur, at most maxc characters around it */
+static char *ti_put(char *d, const char *s, int maxc)
+{
+    int n = slen(s), a = ti_cur > maxc - 1 ? ti_cur - (maxc - 1) : 0, i;
+    for (i = a; i < n && i - a < maxc; i++) { if (i == ti_cur) *d++ = '_'; *d++ = s[i]; }
+    if (ti_cur == i) *d++ = '_';
+    *d = 0;
+    return d;
+}
+static void ti_start(int k)                                  /* k: the key that opened the box */
+{
+    key_hold[k] = -100000;                                   /* held: no auto-repeat into the text */
+    g_typing = 1;
+}
+
+/* Windows device names (before the first '.'): CON PRN AUX NUL COM1-9 LPT1-9 */
+static int reserved_name(const char *b)
+{
+    char w[8];
+    int n = 0;
+    while (b[n] && b[n] != '.' && b[n] != ' ' && n < 5) { w[n] = (char)lower_(b[n]); n++; }
+    w[n] = 0;
+    if (b[n] && b[n] != '.' && b[n] != ' ') return 0;
+    if (same(w, "con") || same(w, "prn") || same(w, "aux") || same(w, "nul")) return 1;
+    return n == 4 && (w[0] == 'c' && w[1] == 'o' && w[2] == 'm' || w[0] == 'l' && w[1] == 'p' && w[2] == 't')
+           && w[3] >= '1' && w[3] <= '9';
+}
+
+static void rename_start(void)
+{
+    const FileEnt *f = &files[vis[menu.sel]];
+    int n = slen(f->name), i, ascii = 1;
+    menu.rn_i = vis[menu.sel];
+    scopy(menu.rn_ext, f->name + n - 4, sizeof(menu.rn_ext));          /* .rep / .prj as written */
+    for (i = 0; i < n; i++) if ((u8)f->name[i] >= 0x80) ascii = 0;
+    menu.rn[0] = 0;
+    if (ascii && n - 4 <= TI_MAX) { scopy(menu.rn, f->name, n - 4 + 1); }   /* without the extension */
+    ti_cur = slen(menu.rn);
+    menu.rn_err[0] = 0;
+    menu.renaming = 1;
+    ti_start('R');
+}
+
+/* RENAME: Enter in the box; 1 = done (box closes) */
+static int rename_do(void)
+{
+    static u8 fd[320];
+    static char old[200];
+    char nw[TI_MAX + 8], *s = menu.rn, *e;
+    int n, ok;
+    void *fh;
+    while (*s == ' ') s++;
+    n = slen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '.')) n--;
+    if (!n) { sput(menu.rn_err, "ENTER A NAME"); return 0; }
+    memcpy(nw, s, n); sput(nw + n, menu.rn_ext);
+    if (reserved_name(nw)) { sput(menu.rn_err, "WINDOWS DOES NOT ALLOW THIS NAME"); return 0; }
+    scopy(old, files[menu.rn_i].name, sizeof(old));
+    if (same(nw, old)) return 1;                                         /* unchanged */
+    cwd_docs();
+    if (!same_ci(nw, old) && pFindFirstFileA) {                          /* not only other letter case */
+        fh = pFindFirstFileA(nw, fd);
+        if (fh && fh != (void *)-1) {
+            pFindClose(fh); cwd_game();
+            sput(menu.rn_err, "A FILE WITH THIS NAME ALREADY EXISTS");
+            return 0;
+        }
+    }
+    ok = pMoveFileA && pMoveFileA(old, nw);
+    cwd_game();
+    if (!ok) { sput(menu.rn_err, "COULD NOT RENAME THE FILE"); return 0; }
+    e = sput(menu.note, "RENAMED "); e = dput(e, old, 50); e = sput(e, " -> "); dput(e, nw, 50);
+    menu.note_until = now_ms() + 2500;
+    logs(menu.note);
+    list_files(menu.mode == 2 ? 1 : 0);
+    build_vis(nw);
+    return 1;
 }
 
 /* CTheScripts: ScriptSpace[OnAMissionFlag] != 0 while a mission runs */
@@ -3056,6 +3225,7 @@ static void menu_open(void)
 {
     menu.open = 1; menu.page = 0; menu.sel = 0; menu.top = 0; menu.confirm_until = 0;
     menu.del_confirm = 0; menu.note_until = 0;
+    menu.finding = 0; menu.renaming = 0; menu.find[0] = 0; g_typing = 0;
 }
 
 /* DELETE PROJECT: remove files[i] from the user folder, then list again */
@@ -3071,15 +3241,13 @@ static void delete_project(int i)
     menu.note_until = now_ms() + 2500;
     logs(menu.note);
     list_files(1);
-    if (menu.sel >= nfiles) menu.sel = nfiles - 1;
-    if (menu.sel < 0) menu.sel = 0;
-    if (menu.top > menu.sel) menu.top = menu.sel;
 }
 
 static void menu_close(void)
 {
     menu.open = 0;
     menu.release_wait = 1;
+    menu.finding = 0; menu.renaming = 0; g_typing = 0;
 }
 
 static int menu_keys_down(void)
@@ -3113,33 +3281,53 @@ static void menu_update(void)
         if (pressed(0x08)) { menu_close(); return; }
         if (pressed(0x0D)) {
             menu.mode = menu.sel;
+            menu.find[0] = 0; menu.finding = 0; menu.renaming = 0;
             list_files(menu.mode == 2 ? 1 : 0);
             menu.page = 1; menu.sel = 0; menu.top = 0; menu.del_confirm = 0; menu.note_until = 0;
         }
         return;
     }
     if (menu.del_confirm) {                                        /* confirm box */
-        if (pressed(0x0D)) { menu.del_confirm = 0; delete_project(menu.sel); }
+        if (pressed(0x0D)) { menu.del_confirm = 0; delete_project(vis[menu.sel]); }
         else if (pressed(0x08)) menu.del_confirm = 0;
+        return;
+    }
+    if (menu.renaming) {                                           /* RENAME box */
+        int r = ti_keys(menu.rn, sizeof(menu.rn));
+        if (r == 1 && rename_do()) menu.renaming = 0;
+        else if (r == -1) menu.renaming = 0;
+        else if (r == 2) menu.rn_err[0] = 0;
+        g_typing = menu.renaming;
         return;
     }
     if (repeat(0x26)) menu.sel--;
     if (repeat(0x28)) menu.sel++;
     if (repeat(0x21)) menu.sel -= MENU_ROWS;
     if (repeat(0x22)) menu.sel += MENU_ROWS;
-    if (pressed(0x24)) menu.sel = 0;
-    if (pressed(0x23)) menu.sel = nfiles - 1;
-    if (menu.sel >= nfiles) menu.sel = nfiles - 1;
+    if (!menu.finding && pressed(0x24)) menu.sel = 0;
+    if (!menu.finding && pressed(0x23)) menu.sel = nvis - 1;
+    if (menu.sel >= nvis) menu.sel = nvis - 1;
     if (menu.sel < 0) menu.sel = 0;
     if (menu.sel < menu.top) menu.top = menu.sel;
     if (menu.sel >= menu.top + MENU_ROWS) menu.top = menu.sel - MENU_ROWS + 1;
+    if (menu.finding) {                                            /* FIND: typing */
+        int r = ti_keys(menu.find, sizeof(menu.find));
+        if (r == 1) menu.finding = 0;                              /* Enter: keep the filter */
+        else if (r == -1) { menu.finding = 0; menu.find[0] = 0; build_vis(sel_name()); }
+        else if (r == 2) build_vis(sel_name());
+        g_typing = menu.finding;
+        return;
+    }
+    if (pressed('F')) { menu.finding = 1; ti_cur = slen(menu.find); ti_start('F'); return; }
+    if (pressed('R') && nvis > 0 && menu.mode != 3) { rename_start(); return; }
     if (pressed(0x08)) {
+        if (menu.find[0]) { menu.find[0] = 0; build_vis(sel_name()); return; }   /* first: clear FIND */
         if (menu.mode == 3) { menu_close(); return; }              /* sub picker: back to the editor */
         menu.page = 0; menu.sel = menu.mode; return;
     }
-    if (pressed(0x0D) && nfiles > 0 && menu.mode == 2) { menu.del_confirm = 1; return; }
-    if (pressed(0x0D) && nfiles > 0) {
-        int sel = menu.sel, mode = menu.mode;
+    if (pressed(0x0D) && nvis > 0 && menu.mode == 2) { menu.del_confirm = 1; return; }
+    if (pressed(0x0D) && nvis > 0) {
+        int sel = vis[menu.sel], mode = menu.mode;
         if (mode != 3 && on_mission() && (int)(menu.confirm_until - now_ms()) <= 0) {
             menu.confirm_until = now_ms() + 4000;
             return;
@@ -3155,6 +3343,7 @@ static void sub_picker(void)
 {
     menu.open = 1; menu.page = 1; menu.mode = 3; menu.sel = 0; menu.top = 0;
     menu.del_confirm = 0; menu.note_until = 0; menu.confirm_until = 0;
+    menu.find[0] = 0; menu.finding = 0; menu.renaming = 0; g_typing = 0;
     list_files(2);
     ed.paused = 1;
 }
@@ -3305,6 +3494,7 @@ static void __cdecl hk_update(void)
     }
     if (menu.open) {                                       /* SUB 1 file picker */
         menu_update();
+        if (g_typing) swallow_keys();                      /* FIND: Esc etc. not seen by the replay */
         ((vfn)orig_update)();
         return;
     }
@@ -3737,8 +3927,12 @@ static void draw_menu(void)
     if (nfiles == 0)
         text(x0 + g_w * 0.030f * K, y0 + lh * 1.8f, 0.8f, 255, 210, 120, menu.mode == 3 ? "NO .rep FILES IN THE USER FOLDER" : menu.mode == 2 ? "NO .prj FILES IN THE USER FOLDER"
              : "NO .rep OR .prj FILES IN THE USER FOLDER (F2 SAVES replay.rep THERE)");
-    for (i = 0; i < MENU_ROWS && menu.top + i < nfiles; i++) {
-        const FileEnt *f = &files[menu.top + i];
+    else if (nvis == 0) {
+        e = sput(line, "NO FILES MATCH \""); e = sput(e, menu.find); sput(e, "\"");
+        text(x0 + g_w * 0.030f * K, y0 + lh * 1.8f, 0.8f, 255, 210, 120, line);
+    }
+    for (i = 0; i < MENU_ROWS && menu.top + i < nvis; i++) {
+        const FileEnt *f = &files[vis[menu.top + i]];
         int idx = menu.top + i;
         u8 c = f->prj && !f->prj_ok ? 140 : 255;
         y = y0 + lh * (1.6f + i);
@@ -3750,26 +3944,51 @@ static void draw_menu(void)
         date_put(line, f->ft);
         text(x0 + g_w * 0.600f * K, y, 0.75f, 190, 190, 190, line);
     }
-    if (nfiles > MENU_ROWS) {                                       /* file count line */
+    if (menu.finding || menu.find[0]) {                             /* FIND line */
+        e = sput(line, "FIND: ");
+        e = menu.finding ? ti_put(e, menu.find, 40) : dput(e, menu.find, 40);
+        e = sput(e, "     "); e = iput(e, nvis, 0); e = sput(e, " / "); e = iput(e, nfiles, 0); sput(e, " FILES");
+        text(x0 + g_w * 0.025f * K, y0 + lh * (MENU_ROWS + 2.2f), 0.65f, 255, 210, 120, line);
+    } else if (nfiles > MENU_ROWS) {                                /* file count line */
         e = iput(line, menu.top + 1, 0); *e++ = '-'; e = iput(e, menu.top + MENU_ROWS < nfiles ? menu.top + MENU_ROWS : nfiles, 0);
         e = sput(e, " / "); iput(e, nfiles, 0);
         text(x0 + g_w * 0.025f * K, y0 + lh * (MENU_ROWS + 2.2f), 0.65f, 170, 170, 170, line);
     }
-    kput(line, menu.mode == 3 ? "UP/DOWN/PGUP/PGDN SELECT     ENTER: USE THIS REPLAY     BACKSPACE / \1 CANCEL"
-             : menu.mode == 2 ? "UP/DOWN/PGUP/PGDN SELECT     ENTER DELETE     BACKSPACE BACK     \1 CLOSE"
-                              : "UP/DOWN/PGUP/PGDN SELECT     ENTER OPEN     BACKSPACE BACK     \1 CLOSE");
+    if (menu.finding)
+        kput(line, "TYPE TO FIND     UP/DOWN/PGUP/PGDN SELECT     ENTER DONE     ESC CLEAR");
+    else if (menu.mode == 3)
+        kput(line, menu.find[0] ? "UP/DOWN/PGUP/PGDN SELECT   ENTER: USE THIS REPLAY   F FIND   BACKSPACE CLEAR FIND   \1 CANCEL"
+                                : "UP/DOWN/PGUP/PGDN SELECT   ENTER: USE THIS REPLAY   F FIND   BACKSPACE / \1 CANCEL");
+    else {
+        e = sput(line, "UP/DOWN/PGUP/PGDN SELECT   ");
+        e = sput(e, menu.mode == 2 ? "ENTER DELETE" : "ENTER OPEN");
+        kput(e, menu.find[0] ? "   F FIND   R RENAME   BACKSPACE CLEAR FIND   \1 CLOSE" : "   F FIND   R RENAME   BACKSPACE BACK   \1 CLOSE");
+    }
     text(x0 + g_w * 0.025f * K, y0 + lh * (MENU_ROWS + 3.1f), 0.65f, 170, 170, 170, line);   /* key line below it */
+    if (menu.renaming) {                                            /* RENAME box over the list */
+        float bx0 = g_w * (0.5f - 0.34f * K), bx1 = g_w * (0.5f + 0.34f * K);
+        float by0 = y0 + lh * 4.0f, by1 = by0 + lh * 6.0f;
+        rect(bx0, by0, bx1, by1, 20, 20, 20, 245);
+        rect(bx0, by0, bx0 + g_w * 0.004f, by1, 235, 125, 40, 255);
+        text(bx0 + g_w * 0.020f * K, by0 + lh * 0.5f, 0.9f, 235, 125, 40, "RENAME FILE");
+        dput(line, files[menu.rn_i].name, 60);
+        text(bx0 + g_w * 0.020f * K, by0 + lh * 1.6f, 0.8f, 190, 190, 190, line);
+        e = sput(line, "NEW NAME: "); e = ti_put(e, menu.rn, 44); sput(e, menu.rn_ext);
+        text(bx0 + g_w * 0.020f * K, by0 + lh * 2.7f, 0.8f, 255, 255, 255, line);
+        if (menu.rn_err[0]) text(bx0 + g_w * 0.020f * K, by0 + lh * 3.8f, 0.7f, 255, 90, 90, menu.rn_err);
+        text(bx0 + g_w * 0.020f * K, by0 + lh * 4.8f, 0.7f, 200, 200, 200, "ENTER: RENAME     ESC: CANCEL");
+    }
+    if ((int)(menu.note_until - now_ms()) > 0 && (int)(menu.confirm_until - now_ms()) <= 0)
+        text(x0 + g_w * 0.025f * K, y0 + lh * (MENU_ROWS + 4.1f), 0.7f, 120, 230, 120, menu.note);
     if (menu.mode == 3) return;
     if (menu.mode == 2) {
-        if ((int)(menu.note_until - now_ms()) > 0)
-            text(x0 + g_w * 0.025f * K, y0 + lh * (MENU_ROWS + 4.1f), 0.7f, 120, 230, 120, menu.note);
-        if (menu.del_confirm && menu.sel < nfiles) {               /* confirm box over the list */
+        if (menu.del_confirm && menu.sel < nvis) {                 /* confirm box over the list */
             float bx0 = g_w * (0.5f - 0.30f * K), bx1 = g_w * (0.5f + 0.30f * K);
             float by0 = y0 + lh * 4.0f, by1 = by0 + lh * 4.4f;
             rect(bx0, by0, bx1, by1, 20, 20, 20, 245);
             rect(bx0, by0, bx0 + g_w * 0.004f, by1, 255, 90, 90, 255);
             text(bx0 + g_w * 0.020f * K, by0 + lh * 0.5f, 0.9f, 255, 90, 90, "DELETE THIS PROJECT?");
-            dput(line, files[menu.sel].name, 60);
+            dput(line, files[vis[menu.sel]].name, 60);
             text(bx0 + g_w * 0.020f * K, by0 + lh * 1.7f, 0.8f, 255, 255, 255, line);
             text(bx0 + g_w * 0.020f * K, by0 + lh * 3.0f, 0.7f, 200, 200, 200, "ENTER: DELETE     BACKSPACE: CANCEL");
         }
@@ -3778,6 +3997,7 @@ static void draw_menu(void)
     if ((int)(menu.confirm_until - now_ms()) > 0)
         text(x0 + g_w * 0.025f * K, y0 + lh * (MENU_ROWS + 4.1f), 0.7f, 255, 90, 90,
              "MISSION IN PROGRESS - A REPLAY MAY BREAK IT.   PRESS ENTER AGAIN TO LOAD ANYWAY");
+    else if ((int)(menu.note_until - now_ms()) > 0) ;
     else if (on_mission())
         text(x0 + g_w * 0.025f * K, y0 + lh * (MENU_ROWS + 4.1f), 0.7f, 255, 170, 90,
              "WARNING: A MISSION IS IN PROGRESS - LOADING A REPLAY MAY BREAK IT");
@@ -3856,6 +4076,23 @@ static long __stdcall crash_filter(void *ep)
    objects go (leftovers would be destroyed after MatFX is closed -> crash) and
    the game's car colours come back. */
 #define SITE_RWTERM 0x4A5B8E
+/* Esc in FIND / RENAME must not open the pause menu. CGame::Process runs
+   CPad::UpdatePads (TempKeyState -> NewKeyState), then CMenuManager::Process
+   (0x49A01C, called at 0x4A4433), which opens the menu on an Esc just-down
+   (NewKeyState.ESC 0x7D17C0), all before CReplay::Update where swallow_keys
+   runs. So Esc is cleared here while typing and until it is released. */
+#define SITE_MENUPROC   0x4A4433
+#define A_NEWKEY_ESC    0x7D17C0
+static u32 orig_menuproc;
+static int g_esc_hold;
+static void __fastcall hk_menuproc(void *mm, void *edx)
+{
+    if (g_typing) g_esc_hold = 1;
+    else if (g_esc_hold && !(pGetAsyncKeyState(0x1B) & 0x8000)) g_esc_hold = 0;
+    if (g_esc_hold) *(short *)A_NEWKEY_ESC = 0;
+    if (orig_menuproc) ((void (__fastcall *)(void *, void *))orig_menuproc)(mm, edx);
+}
+
 static u32 orig_rwterm;
 static void __cdecl hk_rwterm(void)
 {
@@ -3897,6 +4134,8 @@ __declspec(dllexport) int __cdecl RE_Init(void)
     pFindClose = (FindCloseFn)gpa(k32, "FindClose");
     pGetFileSize = (GetFileSizeFn)gpa(k32, "GetFileSize");
     pDeleteFileA = (DeleteFileAFn)gpa(k32, "DeleteFileA");
+    pMoveFileA = (MoveFileAFn)gpa(k32, "MoveFileA");
+    pGetKeyState = (GetKeyStateFn)gpa(u32m, "GetKeyState");
     pGetLocalTime = (GetLocalTimeFn)gpa(k32, "GetLocalTime");
     pIsBadReadPtr = (IsBadReadPtrFn)gpa(k32, "IsBadReadPtr");
     pVirtualFree = (VirtualFreeFn)gpa(k32, "VirtualFree");
@@ -3963,6 +4202,7 @@ __declspec(dllexport) int __cdecl RE_Init(void)
     hook_call(SITE_DEFER2, (void *)deferred_render, "deferred atomics 2");
     orig_addpart = hook_call(SITE_ADDPART, (void *)hk_addpart, "replay particle creation");
     orig_rwterm = hook_call(SITE_RWTERM, (void *)hk_rwterm, "game exit (before RenderWare closes)");
+    orig_menuproc = hook_call(SITE_MENUPROC, (void *)hk_menuproc, "pause menu (Esc while typing)");
     if (orig_addpart) install_partfade();
     if (!orig_update || !orig_playback || !orig_lookaround || !orig_display || !orig_stdcam) { logs("init incomplete"); return -3; }
     g_installed = 1;

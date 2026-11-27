@@ -15,7 +15,7 @@ import sys
 import os
 
 from unicorn import Uc, UC_ARCH_X86, UC_MODE_32, UC_HOOK_CODE
-from unicorn.x86_const import UC_X86_REG_ESP, UC_X86_REG_EAX, UC_X86_REG_EIP
+from unicorn.x86_const import UC_X86_REG_ESP, UC_X86_REG_EAX, UC_X86_REG_EIP, UC_X86_REG_ECX
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from repparse import load  # noqa: E402
@@ -85,7 +85,8 @@ for n, a in (("LookAround", 0x61E970), ("Display", 0x620BE0),
              ("FileWrite", 0x48DF30), ("FileClose", 0x48DEA0)):
     stub(n, a)
 for n in ("ReadFile", "CloseHandle", "VirtualAlloc", "FindFirstFileA", "FindNextFileA", "FindClose",
-          "FileTimeToLocalFileTime", "FileTimeToSystemTime", "GetFileSize", "DeleteFileA", "GetModuleFileNameA", "GetPrivateProfileIntA", "GetLocalTime", "GetPrivateProfileStringA", "VirtualFree"):
+          "FileTimeToLocalFileTime", "FileTimeToSystemTime", "GetFileSize", "DeleteFileA", "GetModuleFileNameA", "GetPrivateProfileIntA", "GetLocalTime", "GetPrivateProfileStringA", "VirtualFree",
+          "MoveFileA", "GetKeyState"):
     stub(n)
 FIND = {}
 FINDDIR = {}
@@ -134,6 +135,8 @@ call_rel(0x4A61D6, 0x620BE0); uc.mem_write(0x4A61DB, b"\xF4")
 call_rel(0x4A45FA, 0x61EF70); uc.mem_write(0x4A45FF, b"\xF4")
 # game exit: call CGame::ShutDown 0x4A5110 at 0x4A5B8E (ShutDown itself = ret here)
 call_rel(0x4A5B8E, 0x4A5110); uc.mem_write(0x4A5110, b"\xC3")
+# CGame::Process: call CMenuManager::Process 0x49A01C (thiscall, no args) at 0x4A4433
+call_rel(0x4A4433, 0x49A01C); uc.mem_write(0x49A01C, b"\xC3")
 stub("StdCam", 0x61EF70)
 STDCAM_POS = (9999.0, 9999.0, 9999.0)   # what the live car camera would show
 wr8(0x6DB5D8, 1)
@@ -301,6 +304,14 @@ def on_code(u, addr, size, _):
         lo = rd32(arg(0))
         uc.mem_write(arg(1), struct.pack("<8H", 2026, 11, 0, 15, 17, lo % 60, 0, 0)); ret, pop = 1, 8
     elif name == "VirtualFree": ret, pop = 1, 12          # bump allocator: nothing to give back
+    elif name == "MoveFileA":                              # fails if the new name exists (other than itself)
+        a = (fsstate["cwd"], read_cstr(arg(0))); b = (fsstate["cwd"], read_cstr(arg(1)))
+        clash = [k for k in FS if k[0] == b[0] and k[1].lower() == b[1].lower() and k != a]
+        ret = 0
+        if a in FS and not clash:
+            FS[b] = FS.pop(a); FTIME[b] = FTIME.pop(a, 0); ret = 1
+        pop = 8
+    elif name == "GetKeyState": ret, pop = 0, 4             # Caps Lock off
     elif name == "VirtualAlloc":
         ret = fsstate.setdefault("arena", 0x01000000); fsstate["arena"] += (arg(1) + 0xFFFF) & ~0xFFFF; pop = 16
     elif name == "SetDirDocs": fsstate["cwd"] = "docs"
@@ -1201,6 +1212,114 @@ check(("docs", "replay.rep") in FS and rd8(MODE) == 0, "other files untouched, n
 frame([0x08]); frame()
 check("DELETE PROJECT" in state["text"] and "OPEN IN REPLAY EDITOR" in state["text"], "Backspace -> back to the main menu")
 frame([0x75]); frame()
+
+# ---------------- FIND / RENAME in the file list ---------------------------------
+VK = {"-": 0xBD, ".": 0xBE, " ": 0x20}
+def typ(txt):
+    for ch in txt:
+        if ch == "_": frame([0x10, 0xBD]); frame([0x10]); continue
+        if ch.isupper(): frame([0x10, ord(ch)]); frame([0x10]); continue
+        frame([VK.get(ch, ord(ch.upper()))]); frame()
+def docs_list():
+    return [k[1] for k in FS if k[0] == "docs" and "\\" not in k[1] and k[1].lower().endswith((".rep", ".prj"))]
+def findline():
+    return [t for t in state["text"] if t.startswith("FIND: ")]
+FS[("docs", "ren-test.rep")] = bytearray(FS[("docs", "old.rep")]); touch(("docs", "ren-test.rep"))
+for _ in range(10): frame()
+frame([0x75]); frame(); frame([0x0D]); frame()                  # OPEN list
+tot = len(docs_list())
+cop = rd8(0x4A4433)
+ctg = (0x4A4433 + 5 + struct.unpack("<i", bytes(uc.mem_read(0x4A4434, 4)))[0]) & 0xFFFFFFFF
+def menu_esc(held):                                             # does Esc reach the pause menu check?
+    keys.clear()
+    if held: keys.add(0x1B)
+    wr16(0x7D17C0, 0xFF)                                        # NewKeyState.ESC (after UpdatePads)
+    uc.reg_write(UC_X86_REG_ESP, STACK); uc.reg_write(UC_X86_REG_ECX, 0x869630)
+    state["mp"] = 0
+    h = uc.hook_add(UC_HOOK_CODE, lambda *_: state.__setitem__("mp", 1), begin=0x49A01C, end=0x49A01C)
+    uc.emu_start(0x4A4433, 0x4A4438)
+    uc.hook_del(h)
+    ok = state["mp"] == 1 and uc.reg_read(UC_X86_REG_ESP) == STACK
+    v = rd16(0x7D17C0); wr16(0x7D17C0, 0)
+    return ok, v != 0
+check(cop == 0xE8 and ctg >= 0x10000000, "the pause menu call (0x4A4433) goes to the DLL: %08X" % ctg)
+check(menu_esc(True) == (True, True), "not typing: Esc reaches the pause menu")
+frame([ord('F')]); frame()
+check(findline() and findline()[0].startswith("FIND: _") and any(t.startswith("TYPE TO FIND") for t in state["text"]),
+      "F opens the find line: %s" % findline())
+check(menu_esc(True) == (True, False), "typing: Esc does not reach the pause menu (menu still runs, stack ok)")
+typ("old")
+want = sorted(n for n in docs_list() if "old" in n.lower())
+got = list_names()
+check(findline() and findline()[0].startswith("FIND: old_") and findline()[0].endswith("%d / %d FILES" % (len(want), tot))
+      and (sorted(got) == want if len(want) <= 12 else len(got) == 12),
+      "typing filters the list: %s %s (want %s)" % (findline(), got, want))
+frame([0x0D]); frame()
+check(rd8(MODE) == 0 and findline() and findline()[0].startswith("FIND: old ") and list_names() == got,
+      "Enter ends typing, the filter stays, nothing opens: %s" % findline())
+frame([0x08]); frame()
+check(not findline() and any(t.startswith("OPEN IN REPLAY EDITOR - SELECT") for t in state["text"]) and len(list_names()) == min(tot, 12),
+      "Backspace clears the filter first (still in the list)")
+frame([ord('F')]); frame(); typ("zzq")
+check('NO FILES MATCH "zzq"' in state["text"] and not list_names(), "no match message")
+frame([0x08]); frame()
+check(findline() and findline()[0].startswith("FIND: zz_"), "Backspace while typing deletes a character")
+frame([0x1B]); frame()
+check(not findline() and len(list_names()) == min(tot, 12), "Esc clears the find")
+frame([ord('F')]); frame(); typ("REN-T"); frame([0x0D]); frame()
+check(list_names() == ["ren-test.rep"], "find is case-insensitive: %s" % list_names())
+# RENAME
+frame([ord('R')]); frame()
+check("RENAME FILE" in state["text"] and "NEW NAME: ren-test_.rep" in state["text"], "R opens the rename box with the name")
+for _ in range(4): frame([0x08]); frame()
+typ("done"); frame([0x0D]); frame()
+check(("docs", "ren-done.rep") in FS and ("docs", "ren-test.rep") not in FS and "RENAMED ren-test.rep -> ren-done.rep" in state["text"]
+      and "RENAME FILE" not in state["text"] and fsstate["cwd"] == "root", "Enter renames the file (extension kept)")
+check('NO FILES MATCH "REN-T"' in state["text"], "the renamed file no longer matches the find")
+frame([0x08]); frame()
+frame([ord('F')]); frame(); typ("ren-done"); frame([0x0D]); frame()
+def rn_clear():
+    frame([ord('R')]); frame()
+    for _ in range(12): frame([0x08]); frame()
+rn_clear(); typ("old"); frame([0x0D]); frame()
+check("A FILE WITH THIS NAME ALREADY EXISTS" in state["text"] and "RENAME FILE" in state["text"] and ("docs", "ren-done.rep") in FS,
+      "an existing name is refused, the box stays")
+typ("x")
+check("A FILE WITH THIS NAME ALREADY EXISTS" not in state["text"] and "NEW NAME: oldx_.rep" in state["text"], "typing clears the error")
+frame([0x1B]); frame()
+check(menu_esc(True) == (True, False), "the Esc that closed the box stays hidden while held")
+check(menu_esc(False) == (True, True) and menu_esc(True) == (True, True), "after release: Esc reaches the pause menu again")
+check("RENAME FILE" not in state["text"] and ("docs", "ren-done.rep") in FS and rd8(MODE) == 0, "Esc cancels the rename")
+rn_clear(); typ("con"); frame([0x0D]); frame()
+check("WINDOWS DOES NOT ALLOW THIS NAME" in state["text"], "reserved names are refused")
+frame([0x1B]); frame()
+rn_clear(); typ("  "); frame([0x0D]); frame()
+check("ENTER A NAME" in state["text"], "an empty name is refused")
+frame([0x1B]); frame()
+rn_clear(); typ("Ren_Done"); frame([0x0D]); frame()
+check(("docs", "Ren_Done.rep") in FS and ("docs", "ren-done.rep") not in FS, "Shift: upper case and _")
+frame([0x08]); frame()
+frame([ord('F')]); frame(); typ("ren_done"); frame([0x0D]); frame()
+rn_clear(); typ("REN"); frame([0x10, 0xBD]); frame([0x10]); typ("DONE"); frame([0x0D]); frame()
+check(("docs", "REN_DONE.rep") in FS and ("docs", "Ren_Done.rep") not in FS, "only the letter case can be changed")
+frame([0x08]); frame()
+del FS[("docs", "REN_DONE.rep")]
+KR = "\xc7\xd1\xb1\xdb.rep"                                      # Korean name (CP949 bytes)
+FS[("docs", KR)] = bytearray(FS[("docs", "old.rep")]); touch(("docs", KR))
+frame([0x08]); frame(); frame([0x0D]); frame()                  # list again (newest first)
+frame([0x24]); frame()
+check(list_names()[0] == "??.rep", "Korean name shown as ??.rep: %s" % list_names()[:2])
+frame([ord('R')]); frame()
+check("NEW NAME: _.rep" in state["text"] and "??.rep" in state["text"], "Korean name: the box starts empty")
+typ("kr"); frame([0x0D]); frame()
+check(("docs", "kr.rep") in FS and ("docs", KR) not in FS, "Korean name renamed")
+del FS[("docs", "kr.rep")]
+frame([0x75]); frame()
+check(not any(t.startswith("FIND") or t.startswith("RENAME") for t in state["text"]), "F6 closes the list")
+frame([0x75]); frame(); frame([0x0D]); frame()
+check(not findline(), "the find is cleared when the list opens again")
+frame([0x75]); frame()
+for _ in range(10): frame()
 
 # ---------------- game exit with the editor open ---------------------------------
 for _ in range(10): frame()

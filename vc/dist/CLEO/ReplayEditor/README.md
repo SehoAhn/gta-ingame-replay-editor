@@ -29,6 +29,7 @@ The mod writes a log to `CLEO\ReplayEditor\ReplayEditor.log`.
      (`Documents\GTA Vice City User Files`, where F2 saves), newest first.
    - **DELETE PROJECT**: lists only the `.prj` files; pick one and confirm (Enter: delete, Backspace: cancel)
      to delete it from the user folder.
+   - In every list, **F** finds files by name and **R** renames the selected file (see below).
 3. After editing, save the project to the same folder
    - **F7 (Save)**: saves into the project you are editing (overwrites it).
      If you opened a `.rep` and have not saved yet, it creates a new project file (same as F8).
@@ -49,8 +50,27 @@ To watch the result, choose F6 → PLAY REPLAY and pick the `.prj` (trim, camera
 |---|---|
 | ↑ ↓ / PgUp PgDn / Home End | Select |
 | Enter | Open (DELETE PROJECT: delete after confirmation) |
-| Backspace | Back |
+| F | Find: type part of a file name; the list shows only the files whose name contains it (any letter case). Enter: done (the list stays filtered), Esc: clear |
+| R | Rename the selected file (not in the SUB file list of the editor) |
+| Backspace | Back (clears the find first, if there is one) |
 | F6 | Close menu |
+
+### Find / rename
+
+- **F (find)**: the line under the list shows `FIND: text` and the number of matching files. ↑ ↓ / PgUp PgDn still
+  select while typing; Enter keeps the filter so you can open, play, delete or rename a found file. F again edits
+  the text, Backspace in the list (or Esc while typing) clears it. Also works in the SUB file list (N / K in the editor).
+- **R (rename)**: a box shows the current name without its extension; edit it and press Enter (Esc: cancel).
+  - The extension (`.rep` / `.prj`) stays the same. Letters, digits, space, `-`, `_` (Shift + `-`) and `.`
+    can be typed; Shift or Caps Lock gives upper case. ← → / Home End move the cursor, Backspace / Delete erase.
+  - An existing file is never overwritten (`A FILE WITH THIS NAME ALREADY EXISTS`); Windows device names
+    (CON, NUL, COM1 …) are refused. Changing only the letter case is allowed.
+  - A name with Korean (or other non-English) characters shows as `?` in the game font, so the box starts empty
+    for such a file: type a new name.
+  - Renaming a `.rep` does not affect projects made from it (a `.prj` contains the whole source replay).
+    `replay.rep` can be renamed to keep it from being overwritten by the next F2.
+- While the text box is open, the keys go only to the box: the game does not see them, and Esc does not
+  open the pause menu. (Typed letters still count toward PC cheat codes, as in normal play.)
 
 ## Editor controls
 
