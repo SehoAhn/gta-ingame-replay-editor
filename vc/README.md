@@ -1,7 +1,9 @@
-# Replay Editor for GTA Vice City (v1.0)
+# Replay Editor for GTA Vice City (v1.02)
 
 A CLEO mod that works like the GTA IV video editor. Open a replay saved with F2 inside the game,
 re-shoot the camera, trim the start and end, and save the result as a project file.
+
+Made by BigSmoke from [gtastunting.net](https://gtastunting.net).
 
 ## Installation
 
@@ -65,7 +67,7 @@ To watch the result, choose F6 → PLAY REPLAY and pick the `.prj` (trim, camera
     can be typed; Shift or Caps Lock gives upper case. ← → / Home End move the cursor, Backspace / Delete erase.
   - An existing file is never overwritten (`A FILE WITH THIS NAME ALREADY EXISTS`); Windows device names
     (CON, NUL, COM1 …) are refused. Changing only the letter case is allowed.
-  - A name with Korean (or other non-English) characters shows as `?` in the game font, so the box starts empty
+  - A name with non-ASCII characters (accented letters, non-Latin scripts, etc.) shows as `?` in the game font, so the box starts empty
     for such a file: type a new name.
   - Renaming a `.rep` does not affect projects made from it (a `.prj` contains the whole source replay).
     `replay.rep` can be renamed to keep it from being overwritten by the next F2.
@@ -226,7 +228,7 @@ when checking an edited camera.
 - A project whose start was trimmed opens at the start mark frame.
 - Keys pressed during a replay (including the editor) are not passed to the game (e.g. no crouching after you exit).
 - When opening a project, the mod briefly creates `ReplayEditor.tmp` in the user folder and deletes it right away.
-- File names with Korean characters show as `?` in the list because the game font has no such glyphs (opening/playing works normally).
+- File names with non-ASCII characters show as `?` in the list because the game font has no such glyphs (opening/playing works normally).
 
 ## Build (development)
 
