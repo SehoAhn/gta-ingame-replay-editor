@@ -1269,11 +1269,11 @@ for _ in range(10): frame()
 for _ in range(10): frame()
 frame([0x75]); frame()
 check("DELETE PROJECT" in state["text"], "F6 menu has a third item DELETE PROJECT")
-check("v1.02" in state["text"], "F6 panel header shows v1.02")
+check("v1.03" in state["text"], "F6 panel header shows v1.03")
 frame([0x26]); frame()                                    # Up wraps to the third item
 frame([0x0D]); frame()
 names = list_names()
-check("v1.02" in state["text"], "file list header shows v1.02")
+check("v1.03" in state["text"], "file list header shows v1.03")
 check(any(t.startswith("DELETE PROJECT - SELECT") for t in state["text"]) and names and all(n.endswith(".prj") for n in names),
       "DELETE PROJECT lists only .prj files: %s" % names)
 idx = names.index("old.edit.prj")

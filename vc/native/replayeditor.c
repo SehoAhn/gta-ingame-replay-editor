@@ -3097,7 +3097,7 @@ static struct {
 static short vis[MAXFILES];            /* the listed files (FIND filter): menu.sel / top index vis[] */
 static int nvis;
 #define MENU_ITEMS 3
-#define RE_VERSION "v1.02"                 /* shown at the right end of the F6 panel header */
+#define RE_VERSION "v1.03"                 /* shown at the right end of the F6 panel header */
 
 static void scan(const char *pattern, const char *ext, int prj)
 {

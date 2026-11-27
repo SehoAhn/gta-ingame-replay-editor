@@ -1,4 +1,4 @@
-# Replay Editor for GTA Vice City (v1.02)
+# Replay Editor for GTA Vice City (v1.03)
 
 A CLEO mod that works like the GTA IV video editor. Open a replay saved with F2 inside the game,
 re-shoot the camera, trim the start and end, and save the result as a project file.
