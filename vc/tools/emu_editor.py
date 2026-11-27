@@ -1056,6 +1056,69 @@ frame([0x21]); frame()                                     # PgUp: select / go t
 sel = hudline("KEYFRAMES")
 kfr = int(sel.split("FRAME ")[1].split()[0]) if "FRAME " in sel else -1
 check(kfr > 61 + 20, "the camera key moved with the main start (now frame %d)" % kfr)
+# ---- camera target: the SUB 1 player (old.rep = the same recording, 1 s earlier here)
+MF = list(pframes(rep_bufs))
+MT, _tl = [], 0
+for fr in MF:
+    for ty, _b, _o, raw in fr:
+        if ty == 9: _tl = struct.unpack_from("<I", raw, 4)[0]
+    MT.append(_tl)
+MP = [struct.unpack_from("<3f", [raw for ty, _b, _o, raw in fr if ty == 5][0], 0x4C) for fr in MF]
+def pos_at(T):                                             # main player at main time T (interpolated)
+    if T <= MT[0]: return MP[0]
+    for i in range(len(MT) - 1):
+        if MT[i] <= T < MT[i + 1] or (T >= MT[i] and MT[i + 1] <= MT[i]):
+            if MT[i + 1] <= MT[i]: continue
+            u = (T - MT[i]) / (MT[i + 1] - MT[i])
+            return [MP[i][k] + (MP[i + 1][k] - MP[i][k]) * u for k in range(3)]
+    return MP[-1]
+pre = kfr - 61                                             # project frame of the main start
+def main_at(f): return MP[f - pre]
+def sub_at(f): return pos_at(MT[f - pre] + 1000)           # SUB 1 starts 1 s before the main
+def aim_err(P):
+    fw, pc = camfwd(), campos()
+    d = [P[0] - pc[0], P[1] - pc[1], P[2] + 0.6 - pc[2]]
+    n = math.sqrt(sum(x * x for x in d)); d = [x / n for x in d]
+    return 1 - sum(a * b for a, b in zip(fw, d))
+frame([0x10, ord('T')]); frame([0x10])
+check(toast_with("KEYFRAME 1: TARGET SUB 1 (USED BY LOOK / FOLLOW)"), "Shift+T on a FREE key: target SUB 1: %s" % toast_with("KEYFRAME"))
+check("(SUB 1)" in hudline("KEYFRAMES") and "1" in state["text"], "HUD and timeline show SUB 1: %s" % hudline("KEYFRAMES"))
+for _ in range(3): frame([ord('T')]); frame()
+check(toast_with("KEYFRAME 1: LOOK AT PLAYER (SUB 1)"), "T -> LOOK AT PLAYER (SUB 1): %s" % toast_with("KEYFRAME"))
+for _ in range(10): frame([0x27]); frame()
+f = shown()
+dsm = math.dist(sub_at(f), main_at(f))
+check(aim_err(sub_at(f)) < 1e-3, "LOOK aims at the SUB 1 player (err %.2g, %.1f m from the main player)" % (aim_err(sub_at(f)), dsm))
+frame([0x21]); frame(); frame([0x10, ord('T')]); frame([0x10])
+check(toast_with("KEYFRAME 1: TARGET MAIN PLAYER") and "(SUB" not in hudline("KEYFRAMES"), "Shift+T wraps to MAIN PLAYER (one sub)")
+for _ in range(10): frame([0x27]); frame()
+check(aim_err(main_at(f)) < 1e-3, "MAIN again: aims at the main player")
+frame([0x21]); frame(); frame([0x10, ord('T')]); frame([0x10])
+frame([ord('T')]); frame()
+check(toast_with("KEYFRAME 1: FOLLOW & LOOK AT PLAYER (SUB 1)"), "T -> FOLLOW & LOOK (SUB 1): %s" % toast_with("KEYFRAME"))
+for _ in range(10): frame([0x27]); frame()
+f1, pc1 = shown(), campos()
+for _ in range(5): frame([0x27]); frame()
+f2, pc2 = shown(), campos()
+o1 = [pc1[k] - sub_at(f1)[k] for k in range(3)]; o2 = [pc2[k] - sub_at(f2)[k] for k in range(3)]
+check(max(abs(o1[k] - o2[k]) for k in range(3)) < 2e-2 and aim_err(sub_at(f2)) < 1e-3,
+      "FOLLOW & LOOK (SUB 1): same offset to the SUB 1 player, aims at it %s %s" % (o1, o2))
+# second key at f2 (inherits FOLLOW & LOOK, SUB 1) -> MAIN: the camera there stays, the look turns over
+frame([ord('K')]); frame()
+check(toast_with("KEYFRAME 2 ADDED") and "(SUB 1)" in hudline("KEYFRAMES"), "new key inherits the target: %s" % hudline("KEYFRAMES"))
+frame([0x10, ord('T')]); frame([0x10])
+pc2b = campos()
+check(toast_with("KEYFRAME 2: TARGET MAIN PLAYER") and max(abs(pc2b[k] - pc2[k]) for k in range(3)) < 2e-2
+      and aim_err(main_at(f2)) < 1e-3, "key 2 -> MAIN: camera stays, aims at the main player")
+frame([0x21]); frame()
+for _ in range(7): frame([0x27]); frame()
+fm = shown(); u = (fm - (kfr - 1)) / (f2 - (kfr - 1))
+blend = [sub_at(fm)[k] + (main_at(fm)[k] - sub_at(fm)[k]) * u for k in range(3)]
+check(aim_err(blend) < 1e-3, "between the keys the look turns from SUB 1 to MAIN (u %.2f, err %.2g)" % (u, aim_err(blend)))
+frame([0x22]); frame(); frame([0x2E]); frame()             # PgDn: key 2, Del
+check("KEYFRAMES 1" in hudline("KEYFRAMES"), "key 2 deleted: %s" % hudline("KEYFRAMES"))
+frame([0x21]); frame()
+check("(SUB 1)" in hudline("KEYFRAMES") and ("FRAME %d" % kfr) in hudline("KEYFRAMES"), "key 1: FOLLOW & LOOK (SUB 1)")
 frame([0x24]); frame()
 check(shown() == 0 and "NO MAIN HERE" in (status_line() or "") or "CAM KEYFRAMES" in (status_line() or ""),
       "before the main start: hint when no camera key applies: %s" % status_line())
@@ -1078,6 +1141,7 @@ for _ in range(3): frame([0x26]); frame()
 frame([0x21]); frame()
 sel = hudline("KEYFRAMES")
 check(("FRAME %d" % kfr) in sel, "camera key restored on the same main moment: %s" % sel)
+check("FOLLOW & LOOK AT PLAYER (SUB 1)" in sel, "the key's target SUB 1 is saved / loaded: %s" % sel)
 frs = slot_frames()
 check(not merged_ok(frs) and len(set(r[1] for fr in frs for t, r in fr if t == 4)) >= 2, "reopened: merged frames, two players")
 # remove: Del twice on the SUB track
@@ -1090,6 +1154,7 @@ check(toast_with("SUB 1 REMOVED") and frames_total() == NFR and "SUB 1" not in s
 for _ in range(3): frame([0x26]); frame()
 frame([0x21]); frame()
 check("FRAME 61" in hudline("KEYFRAMES"), "key back on frame 61 without the sub: %s" % hudline("KEYFRAMES"))
+check("(SUB" not in hudline("KEYFRAMES"), "its sub removed: the key looks at the main player again")
 frs = slot_frames()
 check(not merged_ok(frs) and len(set(r[1] for fr in frs for t, r in fr if t == 4)) == len(set(r[1] for f in pframes(rep_bufs) for t, _b, _o, r in f if t == 4)),
       "without the sub only the main peds remain")
@@ -1142,6 +1207,14 @@ check(nb[-(3 * (268 + src_len) + 4):][:4] == struct.pack("<I", 3), "multi: F8 sa
 exit_ed()
 open_from_menu(0, MP)
 check(rd8(MODE) == 1 and all(("SUB %d" % k) in state["text"] for k in (1, 2, 3)), "multi: reopened with SUB 1..3")
+for _ in range(4): frame([0x10, 0x27]); frame([0x10])       # 4 s: after the main start
+frame([ord('K')]); frame()
+for _ in range(3): frame([0x10, ord('T')]); frame([0x10])
+check(toast_with("KEYFRAME 1: TARGET SUB 3"), "multi: Shift+T x3 -> SUB 3: %s" % toast_with("KEYFRAME"))
+for _ in range(10): frame([0x27]); frame()
+frame([ord('K')]); frame()
+for _ in range(3): frame([0x10, ord('T')]); frame([0x10])   # inherits SUB 3 -> MAIN -> SUB 1 -> SUB 2
+check(toast_with("KEYFRAME 2: TARGET SUB 2"), "multi: key 2 -> SUB 2: %s" % toast_with("KEYFRAME"))
 for _ in range(4): frame([0x28]); frame()                  # SUB 2 (tracks: CAM WEATHER TIME SUB1 SUB2)
 check("SUB 2: old.rep" in hudline("START") and "START -" in hudline("START") and "FRAMES" in hudline("START"), "multi: SUB 2 offset restored: %s" % hudline("START"))
 frame([0x2E]); frame(); frame([0x2E]); frame()
@@ -1149,6 +1222,11 @@ check(toast_with("SUB 2 REMOVED") and "SUB 3" not in state["text"] and "SUB 2" i
 check("START +0 FRAMES" in hudline("START"), "multi: the old SUB 3 (offset 0) is now SUB 2: %s" % hudline("START"))
 frs = slot_frames()
 check(not merged_ok(frs), "multi: frames still valid after the removal")
+for _ in range(4): frame([0x26]); frame()
+frame([0x24]); frame(); frame([0x22]); frame()
+check("SELECTED 1" in hudline("KEYFRAMES") and "(SUB 2)" in hudline("KEYFRAMES"), "multi: the SUB 3 key now looks at SUB 2: %s" % hudline("KEYFRAMES"))
+frame([0x22]); frame()
+check("SELECTED 2" in hudline("KEYFRAMES") and "(SUB" not in hudline("KEYFRAMES"), "multi: the removed SUB 2's key -> main player: %s" % hudline("KEYFRAMES"))
 exit_ed(); frame([0x75]); frame()
 for _ in range(10): frame()
 

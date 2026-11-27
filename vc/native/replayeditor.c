@@ -378,6 +378,8 @@ typedef struct {
     int nf, nch;
     u8 *fslot;                             /* frame starts (chunk, offset) and TIMER, MAXF each */
     u32 *foff, *ftime;
+    u8 *gslot;                             /* its GENERAL packet (chunk, offset): the sub player position */
+    u32 *goff;
     u8 pmap[256], vmap[256];               /* sub pool index -> project pool index */
     u8 pslot[256], vslot[256];             /* project pool slots used by this sub */
     int npslot, nvslot;
@@ -407,9 +409,10 @@ static int sub_build(Sub *S)
     S->nf = 0; S->nch = 0;
     if (!S->data || S->len <= 8) return 0;
     if (!S->fslot && pVirtualAlloc) {
-        u8 *m = (u8 *)pVirtualAlloc(0, MAXF * 9, 0x3000, 4);
+        u8 *m = (u8 *)pVirtualAlloc(0, MAXF * 14, 0x3000, 4);
         if (!m) return 0;
-        S->foff = (u32 *)m; S->ftime = (u32 *)(m + MAXF * 4); S->fslot = m + MAXF * 8;
+        S->foff = (u32 *)m; S->ftime = (u32 *)(m + MAXF * 4); S->goff = (u32 *)(m + MAXF * 8);
+        S->fslot = m + MAXF * 12; S->gslot = m + MAXF * 13;
     }
     if (!S->fslot) return 0;
     S->nch = (int)((S->len - 8 + BUFSZ - 1) / BUFSZ);
@@ -421,11 +424,25 @@ static int sub_build(Sub *S)
             u8 ty = b[off];
             if (ty == 0) break;
             if (ty > 12) return 0;
-            if (!open) { if (S->nf >= MAXF) return 0; S->fslot[S->nf] = (u8)c; S->foff[S->nf] = off; open = 1; }
+            if (!open) {
+                if (S->nf >= MAXF) return 0;
+                S->fslot[S->nf] = (u8)c; S->foff[S->nf] = off; open = 1;
+                S->gslot[S->nf] = 0xFF;            /* no GENERAL yet */
+            }
+            if (ty == 5) { S->gslot[S->nf] = (u8)c; S->goff[S->nf] = off; }
             if (ty == 9) t = *(u32 *)(b + off + 4);
             off += PKT_SIZE[ty];
             if (ty == 8) { S->ftime[S->nf++] = t; open = 0; }
         }
+    }
+    {                                              /* a frame without GENERAL: the nearest one's */
+        int j, v = -1;
+        for (j = 0; j < S->nf; j++) {
+            if (S->gslot[j] != 0xFF) v = j;
+            else if (v >= 0) { S->gslot[j] = S->gslot[v]; S->goff[j] = S->goff[v]; }
+        }
+        for (j = 0; j < S->nf && S->gslot[j] == 0xFF; j++) {}
+        for (v = j - 1; v >= 0 && j < S->nf; v--) { S->gslot[v] = S->gslot[j]; S->goff[v] = S->goff[j]; }
     }
     return S->nf > 0;
 }
@@ -589,6 +606,40 @@ static void player_pos(float t, float *out)
     for (k = 0; k < 3; k++) out[k] = pa[k] + (pb[k] - pa[k]) * u;
 }
 
+/* position of a camera target at fractional project frame t: 0 = the main
+   player (player_pos), n = the player of SUB n (its GENERAL +0x4C, by time;
+   before / after the sub: its first / last position) */
+static const float *sub_gpos(const Sub *S, int j)
+{
+    return (const float *)(S->data + 8 + S->gslot[j] * BUFSZ + S->goff[j] + 0x4C);
+}
+static void target_pos(int tg, float t, float *out)
+{
+    const Sub *S;
+    int a, b, j, k;
+    float T, r0, r1, u;
+    const float *pa, *pb;
+    if (tg <= 0 || tg > g_nsub || nfr <= 0) { player_pos(t, out); return; }
+    k = tg - 1; S = &subs[k];
+    if (!S->data || S->nf <= 0 || S->gslot[0] == 0xFF) { player_pos(t, out); return; }
+    t = fclamp(t, 0, (float)(nfr - 1));
+    a = (int)ffloor_(t);
+    b = a + 1 < nfr ? a + 1 : a;
+    T = (float)rel_ms(a) + (float)(rel_ms(b) - rel_ms(a)) * (t - (float)a);
+    j = ps[k][a];
+    if (j < 0) j = T < (float)sub_rel(k, 0) ? 0 : S->nf - 1;
+    while (j + 1 < S->nf && (float)sub_rel(k, j + 1) <= T) j++;
+    while (j > 0 && (float)sub_rel(k, j) > T) j--;
+    pa = sub_gpos(S, j);
+    if (j + 1 >= S->nf || T <= (float)sub_rel(k, j)) { out[0] = pa[0]; out[1] = pa[1]; out[2] = pa[2]; return; }
+    pb = sub_gpos(S, j + 1);
+    r0 = (float)sub_rel(k, j); r1 = (float)sub_rel(k, j + 1);
+    u = r1 > r0 ? fclamp((T - r0) / (r1 - r0), 0.0f, 1.0f) : 0.0f;
+    out[0] = pa[0] + (pb[0] - pa[0]) * u;
+    out[1] = pa[1] + (pb[1] - pa[1]) * u;
+    out[2] = pa[2] + (pb[2] - pa[2]) * u;
+}
+
 static int g_installed;
 
 /* ---------------------------------------------------------------- camera */
@@ -665,9 +716,11 @@ static const u8 KF_NEXT[KF_NTYPES] = { KF_RECORDED, KF_FOLLOWLOOK, KF_LOOK, KF_F
 typedef struct {
     int frame;
     Pose p;
-    float off[3];                      /* p.pos - player position at frame (FOLLOW) */
+    float off[3];                      /* p.pos - target position at frame (FOLLOW) */
     u8 type, cut;
+    u8 tgt, rsv;                       /* camera target: 0 = main player, n = SUB n player (was padding) */
 } Key;
+typedef char key_size_check[sizeof(Key) == 48 ? 1 : -1];   /* .prj layout */
 
 #define MAXKF 64
 static Key kf[MAXKF];
@@ -688,14 +741,37 @@ static int add_key(int frame, const Pose *p, int *added)
         if (nkf + nhk >= MAXKF) return -1;
         for (j = nkf; j > i; j--) kf[j] = kf[j - 1];
         nkf++;
-        kf[i].frame = frame; kf[i].p = *p; kf[i].cut = 0;
-        /* same type as the previous keyframe in time (FREE when it is the first) */
+        kf[i].frame = frame; kf[i].p = *p; kf[i].cut = 0; kf[i].rsv = 0;
+        /* same type / target as the previous keyframe in time (FREE, main player when it is the first) */
         kf[i].type = i > 0 ? kf[i - 1].type : (u8)KF_FREE;
+        kf[i].tgt = i > 0 ? kf[i - 1].tgt : 0;
         *added = 1;
     }
-    player_pos((float)frame, pl);
+    target_pos(kf[i].tgt, (float)frame, pl);
     for (k = 0; k < 3; k++) kf[i].off[k] = p->pos[k] - pl[k];
     return i;
+}
+
+/* new target for a keyframe: the FOLLOW offset changes, the camera stays */
+static void key_retarget(Key *q, int nt)
+{
+    float a[3], b[3];
+    int k;
+    target_pos(q->tgt, (float)q->frame, a);
+    target_pos(nt, (float)q->frame, b);
+    for (k = 0; k < 3; k++) q->off[k] += a[k] - b[k];
+    q->tgt = (u8)nt;
+}
+
+/* FOLLOW offset of keyframe x relative to target st (x's own when it has that target) */
+static void key_off(const Key *x, int st, float *o)
+{
+    float a[3], b[3];
+    int k;
+    if (x->tgt == st) { o[0] = x->off[0]; o[1] = x->off[1]; o[2] = x->off[2]; return; }
+    target_pos(x->tgt, (float)x->frame, a);
+    target_pos(st, (float)x->frame, b);
+    for (k = 0; k < 3; k++) o[k] = x->off[k] + a[k] - b[k];
 }
 
 static void delete_key(int i)
@@ -715,8 +791,8 @@ static float seg_interp(float p0, float p1, float p2, float p3, float u, int lin
 
 static int eval_path(float t, Pose *out)
 {
-    int i, i0, i2, i3, type, k, ip, fol, lin;
-    float u = 0, pl[3], tgt[3];
+    int i, i0, i2, i3, type, k, ip, fol, lin, st;
+    float u = 0, pl[3], tgt[3], oa[3], ob[3], oc[3], od[3];
     const Key *a, *b, *c, *d;
     if (nkf == 0 || t < (float)kf[0].frame) return 0;
     for (i = 0; i + 1 < nkf && (float)kf[i + 1].frame <= t; i++) {}
@@ -731,13 +807,15 @@ static int eval_path(float t, Pose *out)
     a = &kf[i0]; b = &kf[i]; c = &kf[i2]; d = &kf[i3];
     fol = type == KF_FOLLOW || type == KF_FOLLOWLOOK;
     lin = ip == IP_LINEAR;
+    st = b->tgt;                                   /* the segment follows / looks at its first key's target */
+    if (fol) { key_off(a, st, oa); key_off(b, st, ob); key_off(c, st, oc); key_off(d, st, od); }
     if (ip == IP_CONST && u > 0) {                 /* constant speed along the path: arc-length table */
         float len[17], q[3], prev[3], tot = 0, want;
         int s;
         for (s = 0; s <= 16; s++) {
             float us = (float)s / 16.0f;
             for (k = 0; k < 3; k++)
-                q[k] = fol ? catmull(a->off[k], b->off[k], c->off[k], d->off[k], us) : catmull(a->p.pos[k], b->p.pos[k], c->p.pos[k], d->p.pos[k], us);
+                q[k] = fol ? catmull(oa[k], ob[k], oc[k], od[k], us) : catmull(a->p.pos[k], b->p.pos[k], c->p.pos[k], d->p.pos[k], us);
             if (s) { float dv[3]; dv[0] = q[0] - prev[0]; dv[1] = q[1] - prev[1]; dv[2] = q[2] - prev[2]; tot += fsqrt_(vdot(dv, dv)); }
             len[s] = tot;
             prev[0] = q[0]; prev[1] = q[1]; prev[2] = q[2];
@@ -749,9 +827,9 @@ static int eval_path(float t, Pose *out)
             u = fclamp(u, 0.0f, 1.0f);
         }
     } else u = ease(ip, u);
-    player_pos(t, pl);
+    target_pos(st, t, pl);
     for (k = 0; k < 3; k++) {
-        if (fol) out->pos[k] = pl[k] + seg_interp(a->off[k], b->off[k], c->off[k], d->off[k], u, lin);
+        if (fol) out->pos[k] = pl[k] + seg_interp(oa[k], ob[k], oc[k], od[k], u, lin);
         else out->pos[k] = seg_interp(a->p.pos[k], b->p.pos[k], c->p.pos[k], d->p.pos[k], u, lin);
     }
     out->roll = seg_interp(a->p.roll, b->p.roll, c->p.roll, d->p.roll, u, lin);
@@ -761,7 +839,13 @@ static int eval_path(float t, Pose *out)
         out->yaw = seg_interp(y0, y1, y2, y3, u, lin);
         out->pitch = fclamp(seg_interp(a->p.pitch, b->p.pitch, c->p.pitch, d->p.pitch, u, lin), -1.55f, 1.55f);
     } else {
-        tgt[0] = pl[0]; tgt[1] = pl[1]; tgt[2] = pl[2] + LOOK_Z;
+        tgt[0] = pl[0]; tgt[1] = pl[1]; tgt[2] = pl[2];
+        if (c != b && c->tgt != st) {              /* next key looks at another player: turn over to it */
+            float t2[3];
+            target_pos(c->tgt, t, t2);
+            for (k = 0; k < 3; k++) tgt[k] += (t2[k] - tgt[k]) * u;
+        }
+        tgt[2] += LOOK_Z;
         look_at(out, tgt);
     }
     return 1;
@@ -2003,6 +2087,8 @@ static void open_project(const char *name, int viewer)
     { int i; for (i = 0; i < (int)h.nkf; i++) {
         if (kf[i].type >= KF_NTYPES) kf[i].type = KF_FREE;                     /* unknown type */
         if (kf[i].cut >= IP_N) kf[i].cut = IP_SMOOTH;                          /* unknown interpolation */
+        if (kf[i].tgt > g_nsub) kf[i].tgt = 0;                                 /* its sub is not loaded */
+        kf[i].rsv = 0;
     } }
     memcpy(ek, ld_ek, sizeof(ek));
     nek[0] = ld_nek[0]; nek[1] = ld_nek[1];
@@ -2885,6 +2971,7 @@ static char *offs_put(char *e, int ms)
 }
 
 static char *subname_put(char *e, int k) { e = sput(e, "SUB "); *e++ = (char)('1' + k); *e = 0; return e; }
+static char *tgt_put(char *e, int tg) { return tg ? subname_put(e, tg - 1) : sput(e, "MAIN PLAYER"); }
 
 /* remove sub k (later subs move up: SUB k+1 becomes SUB k) */
 static void drop_sub(int k)
@@ -2892,6 +2979,18 @@ static void drop_sub(int k)
     Sub tmp;
     int i;
     if (k < 0 || k >= g_nsub) return;
+    for (i = 0; i < nkf; i++) {                    /* its keys: main player, camera where it was keyed */
+        if (kf[i].tgt == k + 1) {
+            float pl[3]; int c;
+            player_pos((float)kf[i].frame, pl);
+            for (c = 0; c < 3; c++) kf[i].off[c] = kf[i].p.pos[c] - pl[c];
+            kf[i].tgt = 0;
+        } else if (kf[i].tgt > k + 1) kf[i].tgt--;
+    }
+    for (i = 0; i < nhk; i++) {
+        if (hkf[i].tgt == k + 1) hkf[i].tgt = 0;
+        else if (hkf[i].tgt > k + 1) hkf[i].tgt--;
+    }
     tmp = subs[k];
     if (tmp.data && pVirtualFree) pVirtualFree(tmp.data, 0, 0x8000);
     tmp.data = 0; tmp.len = 0; tmp.skin = 0; tmp.skin_size = 0; tmp.part_size = 0;
@@ -3577,7 +3676,24 @@ static void __cdecl hk_update(void)
         select_key(i < nkf ? i : nkf - 1);
     }
     if (ed.sel >= nkf) ed.sel = nkf - 1;
-    if (pressed('T') && ed.sel >= 0) { kf[ed.sel].type = KF_NEXT[kf[ed.sel].type]; ed.dirty = 1; }
+    if (pressed('T') && ed.sel >= 0) {
+        char line[96], *e;
+        Key *q = &kf[ed.sel];
+        if (key_now[0x10]) {                               /* Shift+T: target MAIN > SUB 1 > .. > SUB n */
+            if (!g_nsub && !q->tgt) { message("NO SUB REPLAY - N: ADD ONE", 700); goto t_done; }
+            key_retarget(q, q->tgt >= g_nsub ? 0 : q->tgt + 1);
+            e = sput(line, "KEYFRAME "); e = iput(e, ed.sel + 1, 0); e = sput(e, ": TARGET ");
+            e = tgt_put(e, q->tgt);
+            if (q->type == KF_FREE || q->type == KF_RECORDED) sput(e, " (USED BY LOOK / FOLLOW)");
+        } else {
+            q->type = KF_NEXT[q->type];
+            e = sput(line, "KEYFRAME "); e = iput(e, ed.sel + 1, 0); e = sput(e, ": "); e = sput(e, KF_NAME[q->type]);
+            if (q->tgt && q->type != KF_FREE && q->type != KF_RECORDED) { e = sput(e, " ("); e = tgt_put(e, q->tgt); sput(e, ")"); }
+        }
+        ed.dirty = 1;
+        message(line, 700);
+    }
+t_done:
     if (pressed('B') && ed.sel >= 0) {
         char line[80], *e;
         kf[ed.sel].cut = (u8)ip_next(kf[ed.sel].cut, 0, key_now[0x10] ? -1 : 1);
@@ -3675,7 +3791,7 @@ static const char *HELP[] = {
     "                MOUSE: LOOK    Z/C: ROLL    R: RESET ROLL    -/=: ZOOM",
     "                SHIFT: FAST    CTRL: SLOW",
     "KEYFRAMES  K: ADD/UPDATE AT THIS FRAME    DEL: DELETE SELECTED    [ / ]: MOVE SELECTED -/+1 FRAME",
-    "                PGUP/PGDN: PREVIOUS/NEXT    T: TYPE    B / SHIFT+B: INTERPOLATION (SMOOTH, LINEAR, EASE.., CUT)",
+    "                PGUP/PGDN: PREVIOUS/NEXT    T / SHIFT+T: TYPE / TARGET    B / SHIFT+B: INTERPOLATION (SMOOTH, LINEAR, EASE.., CUT)",
     "                P: PREVIEW FROM START MARK",
     "TRACKS     UP/DOWN: SELECT TRACK (CAMERA / WEATHER / TIME / SUB 1..9)    N: ADD A SUB REPLAY (UP TO 9)",
     "                WEATHER  T OR ,/.: CHANGE TYPE        TIME  ,/.: -/+ 10 MIN (SHIFT: 1 HOUR)",
@@ -3767,6 +3883,11 @@ static void draw_lane(int tr, float x0, float x1, float y, int selected)
                     rect(kx + (nx - kx) * (float)j / 8.0f, yb - g_h * 0.0045f, kx + (nx - kx) * (float)(j + 1) / 8.0f, yb - g_h * 0.0015f, (u8)v, (u8)v, (u8)v, 230);
                 }
             c[0] = kc[0]; c[1] = kc[1]; c[2] = kc[2];
+            if (kf[i].tgt) {                               /* looks at / follows SUB n: its number */
+                char num[2];
+                num[0] = (char)('0' + kf[i].tgt); num[1] = 0;
+                text(kx + 6.0f, y + g_h * 0.001f, g_nsub > 1 ? 0.55f : 0.7f, 20, 20, 20, num);
+            }
         } else {
             const EKey *a = &ek[tr - 1][i], *b = last ? a : &ek[tr - 1][i + 1];
             for (j = 0; j < 8; j++) {                      /* 8 steps of the segment */
@@ -3824,6 +3945,7 @@ static void draw_editor_hud(void)
             e = sput(e, "    SELECTED "); e = iput(e, ed.sel + 1, 0);
             e = sput(e, ": FRAME "); e = iput(e, kf[ed.sel].frame + 1, 0);
             e = sput(e, "  "); e = sput(e, KF_NAME[kf[ed.sel].type]);
+            if (kf[ed.sel].tgt) { e = sput(e, " ("); e = tgt_put(e, kf[ed.sel].tgt); e = sput(e, ")"); }
             e = sput(e, "  "); e = sput(e, ip_name(kf[ed.sel].cut, 0));
         }
         if (at >= 0) e = sput(e, "    [ON KEYFRAME]");

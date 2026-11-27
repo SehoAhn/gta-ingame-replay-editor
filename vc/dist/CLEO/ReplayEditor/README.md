@@ -92,6 +92,7 @@ To watch the result, choose F6 → PLAY REPLAY and pick the `.prj` (trim, camera
 | | [ / ] | Move the selected keyframe one frame back / forward (all tracks; does nothing if that frame already has a key) |
 | | PgUp / PgDn | Select the previous / next keyframe |
 | | T | Change type: RECORDED CAMERA → FOLLOW PLAYER → LOOK AT PLAYER → FOLLOW & LOOK AT PLAYER → FREE |
+| | Shift+T | Change the target player: MAIN PLAYER → SUB 1 → … → SUB n (the sub replays loaded) |
 | | B / Shift+B | Interpolation to the next keyframe, forward / backward: SMOOTH → LINEAR → EASE IN → EASE OUT → EASE IN-OUT → CONSTANT SPEED → CUT (see below) |
 | | P | Preview from the start mark |
 | Tracks | ↑ / ↓ | Select the track to edit: CAMERA / WEATHER / TIME (/ SUB 1 … SUB 9 for the sub replays added) — K, Del, PgUp/PgDn and B apply to the selected track |
@@ -184,6 +185,13 @@ The status line of a SUB track lists its files in use (`LOOKS: ...`). Notes:
   (the keyframe's own direction, interpolated like FREE — it does not turn toward the player).
 - **FOLLOW & LOOK AT PLAYER**: keeps its position relative to the player and follows them, and also looks at the player every frame.
 - **RECORDED CAMERA**: the original recorded camera for this segment.
+- **Target player** (Shift+T): LOOK AT / FOLLOW use the main player or the player of a sub replay. The HUD shows
+  it as `(SUB n)` and the timeline puts the sub number on the key. Changing the target keeps the camera where it is.
+  - A new keyframe takes the type and target of the previous one.
+  - Before a sub starts / after it ends, its first / last position is used.
+  - When the next keyframe has another target, the look turns from one player to the other over the segment
+    (with CUT it switches at the next keyframe).
+  - Removing a sub sets its keyframes back to the main player; later subs move up (SUB 3 becomes SUB 2).
 - Before the first keyframe the original camera is used; after the last keyframe the last keyframe's camera is held.
 
 ## Settings (`CLEO\ReplayEditor.ini`)
